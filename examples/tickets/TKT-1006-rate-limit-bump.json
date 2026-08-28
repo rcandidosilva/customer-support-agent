@@ -1,0 +1,17 @@
+{
+  "id": "TKT-1006",
+  "subject": "Need our API rate limit raised to 200 req/s",
+  "body": "We're on Team and we keep getting 429s during our nightly load. We need 200 req/s sustained, at least for the next two weeks while we finish a migration. Can you bump it on our workspace? Happy to reduce it afterwards.",
+  "channel": "email",
+  "customer": {
+    "account_id": "acct_6621",
+    "company": "Nine Yards Media",
+    "plan": "team",
+    "seats": 12,
+    "mrr_usd": 360,
+    "tenure_months": 5,
+    "open_tickets": 1,
+    "prior_escalations_90d": 0,
+    "csat_last": 4
+  }
+}

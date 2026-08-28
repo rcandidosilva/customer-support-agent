@@ -1,0 +1,18 @@
+{
+  "id": "TKT-1004",
+  "subject": "Sync delays again - we are not renewing at this rate",
+  "body": "This is the third time this quarter our connectors have fallen hours behind with no warning. Our whole reporting cadence depends on this. I've already had to explain it twice internally. If this isn't fixed and explained properly we will not renew in November, and I've asked our procurement team to start looking at alternatives.",
+  "channel": "email",
+  "customer": {
+    "account_id": "acct_1077",
+    "company": "Meridian Health Group",
+    "plan": "enterprise",
+    "seats": 220,
+    "mrr_usd": 9400,
+    "tenure_months": 34,
+    "open_tickets": 3,
+    "prior_escalations_90d": 2,
+    "csat_last": 2,
+    "notes": "Renewal 2026-11-01. Named AM: J. Okafor."
+  }
+}

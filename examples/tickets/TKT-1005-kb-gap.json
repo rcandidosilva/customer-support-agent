@@ -1,0 +1,17 @@
+{
+  "id": "TKT-1005",
+  "subject": "Embedding a Northwind dashboard inside our Salesforce console",
+  "body": "We want to drop one of our Northwind dashboards into a Salesforce Lightning page so our account executives see it without switching tabs. Is there an embed option with signed URLs, and does the viewer need their own Northwind seat? Our security team will also want to know whether the embed passes the viewer's identity through.",
+  "channel": "web_form",
+  "customer": {
+    "account_id": "acct_5533",
+    "company": "Corvid Software",
+    "plan": "business",
+    "seats": 60,
+    "mrr_usd": 2100,
+    "tenure_months": 11,
+    "open_tickets": 1,
+    "prior_escalations_90d": 0,
+    "csat_last": 4
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": "TKT-1007",
+  "subject": "Getting 403 insufficient_scope on /v2/exports",
+  "body": "Our ETL job started failing this week. GET /v2/datasets works fine with the same token but POST /v2/exports returns 403 insufficient_scope. The token was created back in March and nothing changed on our side. What scope does the exports endpoint need, and do I have to make a new token or can I edit the existing one?",
+  "channel": "email",
+  "customer": {
+    "account_id": "acct_3140",
+    "company": "Kestrel Analytics Ltd",
+    "plan": "business",
+    "seats": 25,
+    "mrr_usd": 1200,
+    "tenure_months": 15,
+    "open_tickets": 1,
+    "prior_escalations_90d": 0,
+    "csat_last": 5
+  }
+}

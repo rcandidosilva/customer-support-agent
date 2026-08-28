@@ -1,0 +1,21 @@
+{
+  "id": "TKT-1008",
+  "subject": "Re: Numbers on our exec dashboard look old",
+  "body": "It's the Snowflake connector, the one called prod-warehouse. The freshness badge says 14 hours. There's nothing on the Activity tab about a backfill.",
+  "channel": "in_app",
+  "history": [
+    "CUSTOMER: Our exec dashboard is showing figures that don't match the warehouse. Can you tell me why it's behind?",
+    "AGENT: Dashboards show a freshness badge with the timestamp of the last completed sync for the underlying tables, and on the Team plan connectors sync at most every 6 hours. So which connector is behind, and what does its freshness badge say? You can find both on Data > Connectors > (connector) > Activity."
+  ],
+  "customer": {
+    "account_id": "acct_8812",
+    "company": "Halcyon Retail",
+    "plan": "team",
+    "seats": 30,
+    "mrr_usd": 900,
+    "tenure_months": 7,
+    "open_tickets": 2,
+    "prior_escalations_90d": 1,
+    "csat_last": 3
+  }
+}

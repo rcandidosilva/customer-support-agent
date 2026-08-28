@@ -1,0 +1,17 @@
+{
+  "id": "TKT-1002",
+  "subject": "Numbers on our exec dashboard look old",
+  "body": "Our exec dashboard is showing figures that don't match what's in the warehouse. Finance flagged it in this morning's review and it was embarrassing. Can you tell me why it's behind and when it will catch up?",
+  "channel": "in_app",
+  "customer": {
+    "account_id": "acct_8812",
+    "company": "Halcyon Retail",
+    "plan": "team",
+    "seats": 30,
+    "mrr_usd": 900,
+    "tenure_months": 7,
+    "open_tickets": 2,
+    "prior_escalations_90d": 1,
+    "csat_last": 3
+  }
+}

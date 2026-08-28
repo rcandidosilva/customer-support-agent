@@ -1,0 +1,18 @@
+{
+  "id": "TKT-1003",
+  "subject": "Charged twice for our annual renewal - $960 out of nowhere",
+  "body": "We were charged $960 on the 3rd and then another $960 on the 4th. Our finance team has flagged both. We only have one subscription. I need the second charge refunded to the card today, and I'd like written confirmation before I have to explain this to our CFO.",
+  "channel": "email",
+  "customer": {
+    "account_id": "acct_2290",
+    "company": "Brightpath Logistics",
+    "plan": "business",
+    "seats": 45,
+    "mrr_usd": 1600,
+    "tenure_months": 26,
+    "open_tickets": 1,
+    "prior_escalations_90d": 0,
+    "csat_last": 5,
+    "notes": "Renewed annually in advance. Billing contact is the CFO's assistant."
+  }
+}

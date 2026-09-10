@@ -400,30 +400,33 @@ def critique_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
     }
 
 
-def _approved_reply(state: LadderState) -> ReviewVerdict | None:
-    """The verdict, if a human wrote the reply this node is about to release.
+def accepted_verdict(state: LadderState) -> ReviewVerdict | None:
+    """The verdict, if a human signed off on what this node is about to release.
 
     Both customer-facing nodes check this first.  Routing a reviewed run back through
-    them - rather than letting the review node emit the reply itself - keeps ``send`` and
+    them - rather than letting a review node emit the reply itself - keeps ``send`` and
     ``clarify`` the only two places a customer ever hears from us, which is what makes
     the edge assertions in ``test_graph`` worth anything.
     """
     record = state.review
     if record is None or not record.accepted:
         return None
-    return record.verdict if record.verdict.edited_reply else None
+    return record.verdict
 
 
 def send_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
-    if (approved := _approved_reply(state)) is not None:
+    if (approved := accepted_verdict(state)) is not None:
+        # A reviewed send never quotes the confidence threshold: the score is below it,
+        # which is why a person was asked. The reason has to name the actual authority.
+        edited = bool(approved.edited_reply)
         return {
             "route": "send",
-            "customer_reply": approved.edited_reply,
+            "customer_reply": approved.edited_reply or state.draft.reply,
             "decision": Decision(
                 route="send",
                 reason=(
-                    f"{approved.reviewer} reviewed the escalation and sent an edited "
-                    "reply instead"
+                    f"{approved.reviewer} reviewed the reply and "
+                    + ("sent an edited version" if edited else "approved it as written")
                 ),
                 rule="human_review",
             ),
@@ -446,7 +449,7 @@ def send_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
 
 
 def clarify_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
-    if (approved := _approved_reply(state)) is not None:
+    if (approved := accepted_verdict(state)) is not None:
         # The human already wrote the question; asking the model to write another one
         # would be both wasteful and a way to lose their wording.
         return {
@@ -455,8 +458,8 @@ def clarify_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
             "decision": Decision(
                 route="clarify",
                 reason=(
-                    f"{approved.reviewer} reviewed the escalation and asked the customer "
-                    "for what is missing instead"
+                    f"{approved.reviewer} reviewed the ticket and asked the customer "
+                    "for what is missing"
                 ),
                 rule="human_review",
             ),
@@ -576,16 +579,38 @@ def handoff_lint_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
 #: statement that no verdict is coming.
 REVIEW_EXPIRED = "expired"
 
-#: What a reviewer looking at a finished escalation brief may decide.  ``escalate`` is
-#: absent on purpose - the run is already escalating, so "approve" *is* "send it to the
-#: queue", and offering both would be two names for one outcome.
-_ESCALATION_REVIEW_ACTIONS = ["approve", "edit_and_send", "ask_customer"]
-
-#: Which node a verdict hands the run to.  Anything not listed - including a refusal and
-#: a timeout - falls through to ``finalise_escalation``, which is what the run would have
-#: done had review never been enabled.  That is the whole safety argument for this node:
-#: every way of failing lands on the pre-existing behaviour.
-_REVIEW_ROUTES = {"edit_and_send": "send", "ask_customer": "clarify"}
+#: What each pause offers, and where each answer sends the run.  The two sites ask
+#: different questions, so the same word means different things at each - which is why
+#: the mapping is keyed by site rather than being one global table.
+#:
+#: At the ``draft`` pause the reviewer is holding an unsent reply, so ``approve`` releases
+#: it and ``escalate`` is a real option: "no, this needs a person".  At the ``escalation``
+#: pause the run is already escalating, so ``approve`` *is* "send it to the queue" and
+#: offering ``escalate`` as well would be two names for one outcome.
+#:
+#: A site's fallback - where refusals, timeouts and unmapped actions go - is the route the
+#: ladder would have taken had review never been enabled.  That is the whole safety
+#: argument: every way of failing lands on the pre-existing behaviour.
+#: ``actions`` is listed rather than derived from ``routes``: an action that resolves to
+#: the site's fallback has no route entry, and ``approve`` at the escalation pause is
+#: exactly that - it queues the brief, which is where the fallback already goes.
+_REVIEW_SITES: dict[str, dict] = {
+    "draft": {
+        "fallback": "handoff",
+        "actions": ["approve", "edit_and_send", "ask_customer", "escalate"],
+        "routes": {
+            "approve": "send",
+            "edit_and_send": "send",
+            "ask_customer": "clarify",
+            "escalate": "handoff",
+        },
+    },
+    "escalation": {
+        "fallback": "finalise_escalation",
+        "actions": ["approve", "edit_and_send", "ask_customer"],
+        "routes": {"edit_and_send": "send", "ask_customer": "clarify"},
+    },
+}
 
 
 def _thread_id(state: LadderState) -> str:
@@ -597,13 +622,16 @@ def _thread_id(state: LadderState) -> str:
     return configurable.get("thread_id") or state.ticket.id
 
 
-def _review_request(state: LadderState, settings: Settings) -> ReviewRequest:
+def _review_request(
+    state: LadderState, settings: Settings, *, site: str, reason: str
+) -> ReviewRequest:
     now = time.time()
     return ReviewRequest(
         ticket_id=state.ticket.id,
         thread_id=_thread_id(state),
-        reason=state.escalation_reason or "the ladder escalated this ticket",
-        allowed_actions=list(_ESCALATION_REVIEW_ACTIONS),
+        site=site,
+        reason=reason,
+        allowed_actions=list(_REVIEW_SITES[site]["actions"]),
         requested_at=now,
         expires_at=now + settings.review.sla_seconds,
     )
@@ -651,65 +679,124 @@ def _read_envelope(raw: object, rebuilt: ReviewRequest) -> ReviewRecord:
     return ReviewRecord(request=request, verdict=verdict)
 
 
-def human_review_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
-    """Pause a finished escalation on a named human, or pass straight through.
+def _pause_for_review(
+    state: LadderState,
+    runtime: Runtime[LadderDeps],
+    *,
+    site: str,
+    reason: str,
+    stage: str,
+) -> dict:
+    """Suspend on a named human, or pass straight through.
 
-    The node sits after the lint loop so the reviewer sees the brief that would actually
-    have been queued, not a draft of it.  When review is disabled it returns ``{}`` and
-    the ladder behaves exactly as it did before this node existed.
+    Shared by both pause sites.  When review is disabled it returns ``{}`` and the ladder
+    behaves exactly as it did before either node existed.
 
     Everything before the ``interrupt()`` call runs a second time when the run resumes -
     that is how LangGraph restores a suspended node - so this body stays cheap and does
     no model work.
+
+    One review per ticket.  A run that has already been in front of a person does not
+    stop again: without this, a reviewer who escalates a draft would then be asked to
+    review the brief their own decision produced.
     """
     settings = runtime.context.settings
-    if not settings.review.enabled:
+    if not settings.review.enabled or state.review is not None:
         return {}
 
-    request = _review_request(state, settings)
+    request = _review_request(state, settings, site=site, reason=reason)
     record = _read_envelope(interrupt(request.model_dump(mode="json")), request)
 
     if not record.accepted:
-        # Fail closed: the packet goes to the queue exactly as it would have anyway.
+        # Fail closed: the run continues to this site's fallback, which is where it would
+        # have gone had review never been enabled.
         return {
             "review": record,
-            "trace": [_row("human_review", ok=False, detail=record.refused)],
+            "trace": [_row(stage, ok=False, detail=record.refused)],
         }
 
     verdict = record.verdict
     waited = verdict.decided_at - record.request.requested_at
-    trace = [
-        _row(
-            "human_review",
-            detail=f"{verdict.action} by {verdict.reviewer} after {waited:.0f}s",
+    detail = f"{verdict.action} by {verdict.reviewer} after {waited:.0f}s"
+    update: dict = {"review": record, "trace": [_row(stage, detail=detail)]}
+
+    if verdict.action == "escalate":
+        # The only verdict that moves a ticket *down* the ladder, so the only one that
+        # has to set the flag every downstream router reads.
+        update["escalation_reason"] = verdict.rationale
+        update["decision"] = Decision(
+            route="escalate",
+            reason=f"{verdict.reviewer} reviewed the draft and sent it to a person",
+            rule="human_review",
         )
-    ]
+        return update
 
-    if verdict.action == "approve":
-        return {
-            "review": record,
-            "decision": Decision(
-                route="escalate",
-                reason=(
-                f"{verdict.reviewer} reviewed the brief and released it to the queue"
-            ),
-                rule="human_review",
-            ),
-            "trace": trace,
-        }
+    if verdict.action == "approve" and site == "escalation":
+        update["decision"] = Decision(
+            route="escalate",
+            reason=f"{verdict.reviewer} reviewed the brief and released it to the queue",
+            rule="human_review",
+        )
+        return update
 
-    # The reviewer overrode the escalation.  Clearing the reason is what makes that real:
-    # every downstream router reads it as "stop climbing", and the clarify branch would
-    # otherwise bounce straight back to handoff.
-    return {"review": record, "escalation_reason": "", "trace": trace}
+    # The reviewer is releasing something to the customer.  Clearing the escalation
+    # reason is what makes that real: every downstream router reads it as "stop
+    # climbing", and the clarify branch would otherwise bounce straight back to handoff.
+    update["escalation_reason"] = ""
+    return update
+
+
+def draft_review_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
+    """The review band: an unsent reply, held for a person to approve or rewrite.
+
+    Sits between the gate and the customer, and only for scores the gate put in the band.
+    This is the rung that changes the economics - a near miss becomes an approval rather
+    than a brief somebody has to write a reply from.
+    """
+    thresholds = runtime.context.settings.thresholds
+    score = state.confidence.score if state.confidence else 0.0
+    return _pause_for_review(
+        state,
+        runtime,
+        site="draft",
+        stage="draft_review",
+        reason=(
+            f"confidence {score:.2f} is below the {thresholds.auto_send:.2f} send "
+            "threshold but close enough that a reviewer can judge the reply directly"
+        ),
+    )
+
+
+def human_review_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
+    """The escalation pause: a finished brief, held before it reaches the queue.
+
+    Sits after the lint loop so the reviewer sees the brief that would actually have been
+    queued, not a draft of it.
+    """
+    return _pause_for_review(
+        state,
+        runtime,
+        site="escalation",
+        stage="human_review",
+        reason=state.escalation_reason or "the ladder escalated this ticket",
+    )
+
+
+def _route_from(state: LadderState, site: str) -> str:
+    """Where a verdict sends the run.  Refusals and timeouts are not in the map."""
+    config = _REVIEW_SITES[site]
+    record = state.review
+    if record is None or not record.accepted:
+        return config["fallback"]
+    return config["routes"].get(record.verdict.action, config["fallback"])
+
+
+def route_from_draft_review(state: LadderState) -> str:
+    return _route_from(state, "draft")
 
 
 def route_from_review(state: LadderState) -> str:
-    """Where a verdict sends the run.  Refusals and timeouts are not in the map."""
-    record = state.review
-    if record is None or not record.accepted:
-        return "finalise_escalation"
-    return _REVIEW_ROUTES.get(record.verdict.action, "finalise_escalation")
+    return _route_from(state, "escalation")
 
 
 def finalise_escalation_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
@@ -789,6 +876,13 @@ def gate_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
 
     if confidence.score >= thresholds.auto_send:
         return {"route": "send"}
+
+    review = runtime.context.settings.review
+    if review.enabled and confidence.score >= review.floor:
+        # A near miss. Cheaper to have a person read one reply than to make them write
+        # one from a brief, so this band is taken before the clarify branch is even
+        # considered - a reviewer can ask the customer themselves if that is the answer.
+        return {"route": "review"}
 
     can_clarify = (
         confidence.score >= thresholds.clarify_floor

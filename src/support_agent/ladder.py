@@ -30,12 +30,14 @@ wrapped: an API outage, a schema violation, and a refusal are the same event to 
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 from pydantic import ValidationError
 
+from . import review_log
 from .config import Settings
 from .graph import build_ladder_graph
 from .llm import LLMClient
@@ -84,11 +86,16 @@ class Ladder:
         settings: Settings | None = None,
         *,
         checkpointer: BaseCheckpointSaver | None = None,
+        verdict_log: str | Path | None = None,
     ) -> None:
         self.llm = llm
         self.kb = kb
         self.settings = settings or Settings()
         self.checkpointer = checkpointer
+        #: Where finished reviews are appended, one JSON object per line.  Every verdict
+        #: is a label on the confidence gate, and this is the only way to tune
+        #: ``auto_send`` against evidence rather than argument.
+        self.verdict_log = Path(verdict_log) if verdict_log else None
         if self.settings.review.enabled and checkpointer is None:
             # Caught here rather than mid-run on purpose.  A pause is only a pause if it
             # can be resumed, and a run that suspends into a checkpointer that does not
@@ -160,6 +167,42 @@ class Ladder:
             if request is not None:
                 pending.append(request)
         return pending
+
+    def stalled_threads(self) -> list[str]:
+        """Runs that are neither finished nor waiting on anyone.
+
+        A crash inside a node *after* a resume leaves this state: the pause is consumed
+        and the verdict applied, but the run stopped partway.  Such a thread has no
+        interrupt, so :meth:`paused_threads` cannot see it and the sweeper will never
+        touch it - the ticket is invisible to every operational surface there is.
+
+        That is the one failure this design does not otherwise catch, so it gets its own
+        query rather than a comment.
+        """
+        if self.checkpointer is None:
+            return []
+
+        stalled = []
+        for thread_id in self._thread_ids():
+            snapshot = self.graph.get_state(self._config(thread_id))
+            if snapshot.next and not snapshot.interrupts:
+                stalled.append(thread_id)
+        return stalled
+
+    def retry(self, thread_id: str) -> Resolution:
+        """Drive a stalled run to completion from wherever it stopped.
+
+        The checkpoint holds everything up to the failed node, so this re-enters at that
+        node rather than re-running the ticket - no repeated model calls, and no second
+        reply to a customer who has already had one.
+        """
+        started_at = time.time()
+        raw = self.graph.invoke(
+            None,
+            context=LadderDeps(llm=self.llm, kb=self.kb, settings=self.settings),
+            config=self._config(thread_id),
+        )
+        return self._resolve(raw, started_at)
 
     def expire_overdue(self, *, now: float | None = None) -> list[Resolution]:
         """Release every review whose deadline has passed.
@@ -238,7 +281,12 @@ class Ladder:
             context=LadderDeps(llm=self.llm, kb=self.kb, settings=self.settings),
             config=self._config(thread_id),
         )
-        return self._resolve(raw, time.time())
+        resolution = self._resolve(raw, time.time())
+        if self.verdict_log is not None:
+            # Written here rather than in the node: a node that interrupts re-runs its
+            # own body, so logging inside one would record every review twice.
+            review_log.append(self.verdict_log, resolution)
+        return resolution
 
     def _resolve(self, raw: dict[str, Any], started_at: float) -> Resolution:
         state = LadderState.model_validate(raw)

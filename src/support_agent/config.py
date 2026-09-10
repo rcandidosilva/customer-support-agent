@@ -70,6 +70,16 @@ class ReviewConfig:
     """
 
     enabled: bool = False
+    #: The review band.  At or above this but below ``auto_send``, a draft is held for a
+    #: human to approve or edit rather than being escalated with a brief.
+    #:
+    #: ``auto_send`` is a cliff: a draft scoring 0.74 with clean citations becomes a full
+    #: escalation, and a person writes a reply from scratch.  That is the most expensive
+    #: possible outcome for a near miss.  This band converts it into the cheapest human
+    #: action there is - reading one reply and saying yes.
+    #:
+    #: Set to ``auto_send`` or above to switch the band off and review only escalations.
+    floor: float = 0.62
     #: How long a brief may sit unreviewed.  On expiry the run finalises as an ordinary
     #: escalation: the packet reaches the queue as it would have without review at all.
     #: The deadline exists because the failure mode of a review step is silence, and
@@ -138,14 +148,51 @@ class Settings:
         return replace(self, model=model)
 
     def with_review(
-        self, *, enabled: bool = True, sla_minutes: int | None = None
+        self,
+        *,
+        enabled: bool = True,
+        sla_minutes: int | None = None,
+        floor: float | None = None,
     ) -> Settings:
-        sla = self.review.sla_minutes if sla_minutes is None else sla_minutes
-        return replace(self, review=ReviewConfig(enabled=enabled, sla_minutes=sla))
+        current = self.review
+        return replace(
+            self,
+            review=ReviewConfig(
+                enabled=enabled,
+                floor=current.floor if floor is None else floor,
+                sla_minutes=current.sla_minutes if sla_minutes is None else sla_minutes,
+            ),
+        )
 
     @classmethod
     def from_env(cls) -> Settings:
         settings = cls()
         if model := os.getenv("SUPPORT_AGENT_MODEL"):
             settings = settings.with_model(model)
+        if os.getenv("SUPPORT_AGENT_REVIEW", "").strip().lower() in ("1", "true", "yes"):
+            settings = settings.with_review(
+                floor=_env_float("SUPPORT_AGENT_REVIEW_FLOOR", settings.review.floor),
+                sla_minutes=_env_int(
+                    "SUPPORT_AGENT_REVIEW_SLA", settings.review.sla_minutes
+                ),
+            )
         return settings
+
+
+def _env_float(name: str, fallback: float) -> float:
+    """A malformed override falls back rather than crashing the process.
+
+    These are operational knobs read at startup, and a typo in a deployment variable
+    should not be able to take the review queue down.
+    """
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return fallback
+
+
+def _env_int(name: str, fallback: int) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return fallback

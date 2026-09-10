@@ -305,6 +305,154 @@ def test_the_deadline_is_the_persisted_one_not_a_resume_time_one(kb, settings: S
     assert not result.review.accepted
 
 
+# -- the review band --------------------------------------------------------------------
+
+#: Fuses to ~0.76 - under the 0.78 send threshold, over the 0.62 band floor. Good enough
+#: for a person to judge the reply directly, not good enough to send unread.
+IN_BAND = {
+    "classify": make_classification(),
+    "draft": make_draft(),
+    "critique": make_critique(
+        groundedness=0.72, coverage=0.66, action_safety=0.75,
+        blocked_on_customer_input=False,
+        problems=["The reply does not mention the SSO case."],
+    ),
+    "handoff": make_packet(),
+}
+
+
+def banded(kb, settings: Settings, **review) -> Ladder:
+    return Ladder(
+        ScriptedLLM(responses=dict(IN_BAND)),
+        kb,
+        settings.with_review(**review),
+        checkpointer=InMemorySaver(),
+    )
+
+
+def test_a_near_miss_pauses_instead_of_escalating(kb, settings: Settings):
+    """The economic point of the band: a person reads one reply, not a whole brief."""
+    ladder = banded(kb, settings)
+    paused = ladder.run(make_ticket())
+
+    assert paused.route == "review"
+    assert paused.review.request.site == "draft"
+    assert paused.draft is not None
+    assert settings.review.floor <= paused.confidence.score < settings.thresholds.auto_send
+    # No brief was written: nobody has to be handed one yet.
+    assert paused.packet is None
+    assert "handoff" not in ladder.llm.stages_called()
+
+
+def test_the_band_offers_the_action_the_escalation_pause_cannot(kb, settings: Settings):
+    """`escalate` finally means something: the run is not escalating yet."""
+    ladder = banded(kb, settings)
+    request = ladder.run(make_ticket()).review.request
+    assert request.allowed_actions == [
+        "approve", "edit_and_send", "ask_customer", "escalate",
+    ]
+
+
+def test_approving_a_draft_sends_the_agents_own_reply(kb, settings: Settings):
+    ladder = banded(kb, settings)
+    ladder.run(make_ticket())
+    result = ladder.resume("TKT-TEST", ReviewVerdict(action="approve", reviewer="alice"))
+
+    assert result.route == "send"
+    assert result.customer_reply == make_draft().reply
+    assert result.decision.rule == "human_review"
+
+
+def test_a_reviewed_send_does_not_claim_the_confidence_threshold(kb, settings: Settings):
+    """The score is *below* auto_send - that is why a person was asked.
+
+    Quoting the threshold here would put a false statement in the audit trail of every
+    banded send.
+    """
+    ladder = banded(kb, settings)
+    ladder.run(make_ticket())
+    result = ladder.resume("TKT-TEST", ReviewVerdict(action="approve", reviewer="alice"))
+
+    assert "auto-send threshold" not in result.decision.reason
+    assert "alice" in result.decision.reason
+
+
+def test_a_reviewer_can_reject_a_draft_to_a_person(kb, settings: Settings):
+    ladder = banded(kb, settings)
+    ladder.run(make_ticket())
+    result = ladder.resume(
+        "TKT-TEST",
+        ReviewVerdict(action="escalate", reviewer="bo",
+                      rationale="needs the invoice line items"),
+    )
+
+    assert result.route == "escalate"
+    assert result.customer_reply == ""
+    assert result.packet is not None, "rejecting to a person still writes them a brief"
+
+
+def test_a_rejected_draft_does_not_pause_a_second_time(kb, settings: Settings):
+    """One review per ticket.
+
+    Without this the reviewer who escalated a draft is asked to review the brief their
+    own decision produced - which is both absurd and a way to strand a ticket behind two
+    deadlines.
+    """
+    ladder = banded(kb, settings)
+    ladder.run(make_ticket())
+    result = ladder.resume(
+        "TKT-TEST",
+        ReviewVerdict(action="escalate", reviewer="bo", rationale="needs invoice lines"),
+    )
+
+    assert not result.pending_review
+    assert ladder.paused_threads() == []
+    assert [t.stage for t in result.trace].count("draft_review") == 1
+    assert "human_review" not in [t.stage for t in result.trace]
+
+
+def test_an_unanswered_draft_becomes_an_ordinary_escalation(kb, settings: Settings):
+    """The band's fallback is the route the gate would have taken without it."""
+    ladder = banded(kb, settings)
+    ladder.run(make_ticket())
+    result = ladder.expire("TKT-TEST")
+
+    assert result.route == "escalate"
+    assert result.packet is not None
+    assert not result.review.accepted
+    # And the escalation pause does not then fire on the way out.
+    assert not result.pending_review
+
+
+def test_the_band_is_off_when_review_is_off(kb, settings: Settings):
+    """Scores in the band escalate exactly as they did before."""
+    result = Ladder(ScriptedLLM(responses=dict(IN_BAND)), kb, settings).run(make_ticket())
+    assert result.route == "escalate"
+    assert result.review is None
+
+
+def test_a_high_floor_switches_the_band_off(kb, settings: Settings):
+    """The documented way to review escalations only."""
+    ladder = banded(kb, settings, floor=settings.thresholds.auto_send)
+    paused = ladder.run(make_ticket())
+
+    assert paused.route == "review"
+    assert paused.review.request.site == "escalation", "should be the brief, not the draft"
+
+
+def test_a_confident_answer_still_never_pauses(kb, settings: Settings):
+    """The band must not drag the happy path in front of a person."""
+    ladder = Ladder(
+        ScriptedLLM(responses={"classify": make_classification(), "draft": make_draft(),
+                               "critique": make_critique()}),
+        kb, settings.with_review(), checkpointer=InMemorySaver(),
+    )
+    result = ladder.run(make_ticket())
+
+    assert result.route == "send"
+    assert result.review is None
+
+
 # -- the sweeper ------------------------------------------------------------------------
 
 
@@ -373,6 +521,77 @@ def test_a_ladder_with_no_store_has_nothing_to_sweep(kb, settings: Settings):
     ladder = Ladder(ScriptedLLM(), kb, settings)
     assert ladder.paused_threads() == []
     assert ladder.expire_overdue() == []
+    assert ladder.stalled_threads() == []
+
+
+# -- stalled runs -----------------------------------------------------------------------
+
+
+def test_a_crash_after_a_verdict_leaves_a_thread_nothing_can_see(kb, settings: Settings):
+    """A run that stopped partway has no interrupt, so no queue and no sweep finds it.
+
+    Found by running the CLI, not by reasoning about it: rejecting a draft writes a
+    brief, the model call for it failed, and the ticket vanished from every operational
+    surface at once - the pause already spent, the run unfinished.
+    """
+    saver = InMemorySaver()
+    # No `handoff` response, so writing the brief raises after the verdict is applied.
+    ladder = Ladder(
+        ScriptedLLM(responses={k: v for k, v in IN_BAND.items() if k != "handoff"}),
+        kb, settings.with_review(), checkpointer=saver,
+    )
+    ladder.run(make_ticket())
+
+    with pytest.raises(AssertionError, match="no response for stage 'handoff'"):
+        ladder.resume(
+            "TKT-TEST",
+            ReviewVerdict(action="escalate", reviewer="bo", rationale="needs invoices"),
+        )
+
+    assert ladder.paused_threads() == [], "the pause was spent"
+    assert ladder.expire_overdue() == [], "and no deadline will ever fire"
+    assert ladder.stalled_threads() == ["TKT-TEST"], "so it needs its own query"
+
+
+def test_a_stalled_run_can_be_driven_to_completion(kb, settings: Settings):
+    """Recovery re-enters at the failed node rather than re-running the ticket."""
+    saver = InMemorySaver()
+    scripted = ScriptedLLM(
+        responses={k: v for k, v in IN_BAND.items() if k != "handoff"}
+    )
+    ladder = Ladder(scripted, kb, settings.with_review(), checkpointer=saver)
+    ladder.run(make_ticket())
+    with pytest.raises(AssertionError):
+        ladder.resume(
+            "TKT-TEST",
+            ReviewVerdict(action="escalate", reviewer="bo", rationale="needs invoices"),
+        )
+
+    # A second ladder with the brief available, standing in for the fixed deployment.
+    recovered = Ladder(
+        ScriptedLLM(responses={"handoff": make_packet()}),
+        kb, settings.with_review(), checkpointer=saver,
+    ).retry("TKT-TEST")
+
+    assert recovered.route == "escalate"
+    assert recovered.packet is not None
+    assert recovered.review.verdict.reviewer == "bo", "the verdict survived the crash"
+    # Re-entered at the failed node: nothing before it ran a second time.
+    assert [t.stage for t in recovered.trace].count("classify") == 1
+
+
+def test_a_finished_run_is_not_stalled(kb, settings: Settings):
+    ladder = banded(kb, settings)
+    ladder.run(make_ticket())
+    ladder.resume("TKT-TEST", ReviewVerdict(action="approve", reviewer="alice"))
+    assert ladder.stalled_threads() == []
+
+
+def test_a_paused_run_is_not_stalled(kb, settings: Settings):
+    """The distinction the query rests on: waiting on a person is not being stuck."""
+    ladder = banded(kb, settings)
+    ladder.run(make_ticket())
+    assert ladder.paused_threads() and ladder.stalled_threads() == []
 
 
 # -- the audit trail --------------------------------------------------------------------

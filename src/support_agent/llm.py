@@ -224,6 +224,28 @@ class AnthropicLLM:
 # --------------------------------------------------------------------------------------
 
 
+class UnavailableLLM:
+    """A client that reports every stage as unavailable, using the normal failure path.
+
+    Used where a model *might* be needed but no credentials are configured - answering a
+    review, for instance, needs one only if the verdict sends the ticket to a person and
+    a brief has to be written.
+
+    It raises :class:`LLMError` rather than anything else on purpose: that is the event
+    the ladder already knows how to survive, so a missing key degrades into a
+    deterministically assembled packet instead of a traceback.
+    """
+
+    def __init__(self, reason: str = "no API credentials are configured") -> None:
+        self.reason = reason
+
+    def structured(self, *, stage, system, user, schema, effort="medium", max_tokens=4096):
+        raise LLMError(stage, self.reason)
+
+    def text(self, *, stage, system, user, effort="medium", max_tokens=4096):
+        raise LLMError(stage, self.reason)
+
+
 @dataclass
 class ScriptedLLM:
     """Returns canned objects per stage; raises :class:`LLMError` where told to.

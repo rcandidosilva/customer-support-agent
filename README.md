@@ -4,7 +4,8 @@ A worked example of **confidence-gated routing**: a ticket comes in, an automate
 agent tries to answer it from a knowledge base, and an independent reviewer decides
 whether that answer is good enough to send, good enough to ask one follow-up question
 about, or not good enough at all — in which case the agent writes a **handoff packet** for
-a human colleague and gets out of the way.
+a human colleague and gets out of the way. Optionally, it stops there and waits for that
+colleague: see [Human review](#human-review).
 
 The interesting artifact here is the handoff packet, not the answer. Any RAG pipeline can
 answer easy tickets. The thing worth building carefully is what happens on the ~30% it
@@ -42,11 +43,20 @@ would have started with the raw email, or a minute behind.
           ┌───────┐   ┌─────────┐   ┌──────────────────────────────────────┐
           │ SEND  │   │ CLARIFY │   │  ESCALATE  →  handoff packet          │
           └───────┘   └─────────┘   └──────────────────────────────────────┘
-                       only if the      written for a colleague, not a customer
-                       missing piece    ├─ lint-checked for customer voice
-                       is the           └─ falls back to an auto-assembled packet
-                       customer's          if the model itself is unavailable
-                       to give
+              ▲            ▲          only if the      written for a colleague,
+              │            │          missing piece    not a customer
+              │            │          is the           ├─ lint-checked for voice
+              │            │          customer's       └─ falls back to an auto-
+              │            │          to give             assembled packet if the
+              │            │                              model is unavailable
+              │            │                     │
+              │            │                     ▼  (optional, off by default)
+              │            │            ┌──────────────────┐
+              └────────────┴────────────│  HUMAN REVIEW    │  a named reviewer may
+             only on a validated verdict└────────┬─────────┘  approve, edit and send,
+             from a named reviewer               │            or turn it into a
+                                                 ▼            question — or the SLA
+                                        the queue, unchanged  runs out and it queues
 ```
 
 ## Run it
@@ -278,11 +288,8 @@ escaping review.
 
 **Durability.** `LadderState` is serialisable end to end, so `Ladder(..., checkpointer=...)`
 persists a run and threads default to the ticket id — a ticket coming back after a
-clarifying question resumes its own history instead of re-deriving it. What I did *not*
-wire up is `interrupt()` for the human-review step: it is the natural next move and maps
-exactly onto `escalate`, but it changes `run()` from "returns a Resolution" to "may return
-a pause", and that is a calling-contract change worth making deliberately rather than as a
-side effect of a port.
+clarifying question resumes its own history instead of re-deriving it. That is also what
+made the human-review step below possible: a pause is only a pause if it can be resumed.
 
 What stayed out of the graph: [`llm.py`](src/support_agent/llm.py) still talks to Claude
 through the Anthropic SDK directly, and [`policy.py`](src/support_agent/policy.py) is
@@ -290,6 +297,88 @@ still plain deterministic Python. Neither gains anything from the framework, and
 would lose per-stage `effort`, cache-control placement, refusal handling, and — the
 expensive one — `ScriptedLLM`, which is why 122 tests run in under half a second with no
 network.
+
+## Human review
+
+The ladder's third rung hands a ticket to a person, but until recently "a person" meant a
+brief landing in a queue — the graph finished and a human read the output later. Setting
+`Settings.review.enabled` turns that into a real pause on a named reviewer, using
+LangGraph's `interrupt()`.
+
+```python
+ladder = Ladder(llm, kb, settings.with_review(sla_minutes=30),
+                checkpointer=SqliteSaver.from_conn_string("reviews.db"))
+
+paused = ladder.run(ticket)
+paused.route            # "review"  — non-terminal
+paused.packet           # the brief the reviewer is looking at
+paused.pending_review   # True
+
+final = ladder.resume(ticket.id, ReviewVerdict(
+    action="edit_and_send", reviewer="alice",
+    edited_reply="Refunded the duplicate charge — it lands in 5-10 days.",
+))
+final.route             # "send"
+```
+
+Four things about the design are load-bearing.
+
+**`run()` still returns a `Resolution`.** The obvious way to add a pause is to change the
+return type, and it poisons every caller — including the ones that never enable review. So
+`review` is a fourth `Route` instead, and a paused run is a resolution that happens not to
+be terminal. Callers with review off cannot observe one.
+
+**The verdict is a schema, not a resume payload.** `interrupt()` hands back whatever the
+caller passes, which makes it the least-typed input in the system and the only one that
+can put text in front of a customer. `ReviewVerdict` gets the same treatment as a model
+response: `extra="forbid"`, a named reviewer, and cross-field checks — an `edit_and_send`
+with no reply and an override with no rationale are both rejected.
+
+**Every way of failing lands on the old behaviour.** A verdict that will not parse, one
+asking for an action this pause does not offer, and a deadline that passes with nobody
+looking all route to `finalise_escalation` — the brief goes to the queue exactly as it
+would have without review. The failure mode of a review step is silence, and silence must
+not be able to hold a ticket forever, so `review.sla_minutes` bounds it and
+`expire_overdue()` enforces it on a timer:
+
+```python
+with sqlite_saver("reviews.db") as saver:
+    sweeper = Ladder(llm, kb, settings.with_review(), checkpointer=saver)
+    sweeper.paused_threads()   # every ticket waiting, discovered from the store
+    sweeper.expire_overdue()   # release the ones past their deadline
+```
+
+`paused_threads()` enumerates the store rather than remembering anything, so the sweeper
+does not have to be the process that opened the pause. Without it the deadline would bind
+only on contact — when somebody happened to call `resume` — and a thread nobody touched
+would wait forever, which is the failure it exists to prevent.
+
+**The deadline lives in the checkpoint.** This is the subtle one. LangGraph re-runs a
+suspended node's body from the top on resume, so any clock read inside the node restarts
+at resume time — which would make a verdict impossible to be late and the SLA silently
+inert. The authoritative `ReviewRequest` is the one persisted alongside the interrupt;
+`Ladder.pending_review()` reads it back, and `Ladder.resume()` judges the deadline against
+it before the node ever sees a verdict.
+
+The structural guarantee in `graph.py` had to be restated rather than quietly relaxed.
+`send` used to be reachable only from `gate`; it is now reachable from `gate` or from
+`human_review`, and `test_every_failure_edge_points_at_the_handoff` asserts exactly that
+pair. Automation still cannot promote itself — the one edge back up the ladder needs a
+named human on it.
+
+**Persistence is a first-class concern, not a config flag.**
+[`checkpointing.py`](src/support_agent/checkpointing.py) exists because LangGraph will not
+deserialise arbitrary classes out of a checkpoint — reasonably, since that is an
+arbitrary-import gadget — so every persisted type has to be named in an allowlist. It is
+derived from the modules rather than typed out, which matters more than it looks: an
+*empty* allowlist only warns, but once an explicit one exists an omission becomes a hard
+block. A half-complete allowlist is worse than none. `LadderState` lives in `nodes.py`
+rather than `models.py` and was exactly the omission that proved the point.
+
+What is deliberately *not* here yet: a review band below `auto_send` (today only
+escalations pause, so a near-miss draft still costs a human a full write-up rather than an
+approval), a CLI to drive the queue, and the verdict log that would let `auto_send` be
+tuned against evidence instead of argument.
 
 ## The policy gate
 
@@ -314,8 +403,9 @@ to the escalation is the one a human would lead with.
 | [`stages/`](src/support_agent/stages) | One module per rung. All the prompts live here. |
 | [`graph.py`](src/support_agent/graph.py) | The LangGraph topology — the whole routing policy, on one screen. |
 | [`nodes.py`](src/support_agent/nodes.py) | The node bodies and the graph state. |
-| [`ladder.py`](src/support_agent/ladder.py) | The facade: `Ladder(llm, kb).run(ticket) -> Resolution`. |
+| [`ladder.py`](src/support_agent/ladder.py) | The facade: `Ladder(llm, kb).run(ticket) -> Resolution`, plus `pending_review` / `resume` / `expire` for the human-review pause. |
 | [`handoff_lint.py`](src/support_agent/handoff_lint.py) | Mechanical quality checks on the brief. |
+| [`checkpointing.py`](src/support_agent/checkpointing.py) | The durable store a paused review lives in, and the serde allowlist that lets it be read back. |
 | [`llm.py`](src/support_agent/llm.py) | The only module that talks to Claude. `ScriptedLLM` is the same interface with no network. |
 | [`kb/`](src/support_agent/kb) | Twelve help-centre articles for a fictional analytics SaaS. |
 | [`examples/offline_demo.py`](examples/offline_demo.py) | All three routes, scripted end to end, no credentials. |
@@ -340,9 +430,17 @@ assert result.draft is not None      # the human still gets to see it
 assert result.confidence is None     # but nothing verified it
 ```
 
-122 tests cover retrieval, every policy rule, the fusion caps and floors, every lint rule,
-all four routes, all five degradation paths, the lint rewrite loop, and the topology
-itself.
+155 tests cover retrieval, every policy rule, the fusion caps and floors, every lint rule,
+all four routes, all five degradation paths, the lint rewrite loop, the human-review pause
+(including every way a verdict can be refused), the expiry sweeper, and the topology
+itself. Two of them spawn a real subprocess to prove a pause survives the process that
+opened it — the one claim an in-memory checkpointer cannot make.
+
+The review tests were written against mutations rather than against the implementation:
+each invariant was checked by breaking it on purpose and confirming a test caught it.
+Two of the first three mutations survived, which is how
+`test_a_refused_verdict_cannot_reach_the_customer` and
+`test_the_record_keeps_the_request_that_was_actually_made` came to exist.
 
 ## Adapting this
 

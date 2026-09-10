@@ -15,7 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "langgraph-checkpoint-sqlite>=2.0"]
+# A durable store for runs paused on human review. Not needed to run the ladder, and not
+# needed by the test suite's in-memory checkpoints - only to keep a review queue across a
+# restart, which is the point of having one.
+sqlite = ["langgraph-checkpoint-sqlite>=2.0"]
 
 [project.scripts]
 support-agent = "support_agent.cli:main"

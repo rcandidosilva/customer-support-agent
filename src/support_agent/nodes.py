@@ -17,8 +17,10 @@ from dataclasses import dataclass
 from operator import add
 from typing import Annotated
 
+from langgraph.config import get_config
 from langgraph.runtime import Runtime
-from pydantic import BaseModel, Field
+from langgraph.types import interrupt
+from pydantic import BaseModel, Field, ValidationError
 
 from .config import Settings
 from .handoff_lint import has_errors, lint_packet
@@ -32,6 +34,9 @@ from .models import (
     HandoffPacket,
     Resolution,
     RetrievedChunk,
+    ReviewRecord,
+    ReviewRequest,
+    ReviewVerdict,
     Route,
     StageTrace,
     Ticket,
@@ -93,12 +98,23 @@ class LadderState(BaseModel):
     #: Verbatim of the last thing we sent this customer, carried into the packet.
     already_told: str = ""
 
+    #: What a human was asked and what they decided.  Set only once a verdict (or a
+    #: refusal, or a timeout) has come back - a run that is *currently* paused has no
+    #: state written for it at all, because LangGraph discards a node's writes when it
+    #: interrupts.  The pending request lives in the checkpoint, not here.
+    review: ReviewRecord | None = None
+
     #: Lint findings from the previous handoff attempt, fed back into the next one.
     lint_feedback: list[str] = Field(default_factory=list)
     handoff_attempts: int = 0
 
     trace: Annotated[list[StageTrace], add] = Field(default_factory=list)
     degraded: bool = False
+
+    #: Stamped when the run starts and carried through the checkpoint, so a run that
+    #: resumes after a human review still reports end-to-end latency rather than the
+    #: latency of its last leg.
+    started_at: float = Field(default_factory=time.time)
 
 
 # --------------------------------------------------------------------------------------
@@ -384,7 +400,36 @@ def critique_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
     }
 
 
+def _approved_reply(state: LadderState) -> ReviewVerdict | None:
+    """The verdict, if a human wrote the reply this node is about to release.
+
+    Both customer-facing nodes check this first.  Routing a reviewed run back through
+    them - rather than letting the review node emit the reply itself - keeps ``send`` and
+    ``clarify`` the only two places a customer ever hears from us, which is what makes
+    the edge assertions in ``test_graph`` worth anything.
+    """
+    record = state.review
+    if record is None or not record.accepted:
+        return None
+    return record.verdict if record.verdict.edited_reply else None
+
+
 def send_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
+    if (approved := _approved_reply(state)) is not None:
+        return {
+            "route": "send",
+            "customer_reply": approved.edited_reply,
+            "decision": Decision(
+                route="send",
+                reason=(
+                    f"{approved.reviewer} reviewed the escalation and sent an edited "
+                    "reply instead"
+                ),
+                rule="human_review",
+            ),
+            "trace": [_row("route", detail="send (human review)")],
+        }
+
     thresholds = runtime.context.settings.thresholds
     return {
         "route": "send",
@@ -401,6 +446,23 @@ def send_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
 
 
 def clarify_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
+    if (approved := _approved_reply(state)) is not None:
+        # The human already wrote the question; asking the model to write another one
+        # would be both wasteful and a way to lose their wording.
+        return {
+            "route": "clarify",
+            "customer_reply": approved.edited_reply,
+            "decision": Decision(
+                route="clarify",
+                reason=(
+                    f"{approved.reviewer} reviewed the escalation and asked the customer "
+                    "for what is missing instead"
+                ),
+                rule="human_review",
+            ),
+            "trace": [_row("route", detail="clarify (human review)")],
+        }
+
     deps = runtime.context
     thresholds = deps.settings.thresholds
     try:
@@ -506,6 +568,150 @@ def handoff_lint_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
     }
 
 
+# --------------------------------------------------------------------------------------
+# Human review
+# --------------------------------------------------------------------------------------
+
+#: Key the facade sets on the resume envelope when the SLA ran out.  Not a verdict: a
+#: statement that no verdict is coming.
+REVIEW_EXPIRED = "expired"
+
+#: What a reviewer looking at a finished escalation brief may decide.  ``escalate`` is
+#: absent on purpose - the run is already escalating, so "approve" *is* "send it to the
+#: queue", and offering both would be two names for one outcome.
+_ESCALATION_REVIEW_ACTIONS = ["approve", "edit_and_send", "ask_customer"]
+
+#: Which node a verdict hands the run to.  Anything not listed - including a refusal and
+#: a timeout - falls through to ``finalise_escalation``, which is what the run would have
+#: done had review never been enabled.  That is the whole safety argument for this node:
+#: every way of failing lands on the pre-existing behaviour.
+_REVIEW_ROUTES = {"edit_and_send": "send", "ask_customer": "clarify"}
+
+
+def _thread_id(state: LadderState) -> str:
+    """The thread this run is checkpointed under, for the reviewer to address."""
+    try:
+        configurable = (get_config() or {}).get("configurable") or {}
+    except RuntimeError:  # called outside a graph run
+        configurable = {}
+    return configurable.get("thread_id") or state.ticket.id
+
+
+def _review_request(state: LadderState, settings: Settings) -> ReviewRequest:
+    now = time.time()
+    return ReviewRequest(
+        ticket_id=state.ticket.id,
+        thread_id=_thread_id(state),
+        reason=state.escalation_reason or "the ladder escalated this ticket",
+        allowed_actions=list(_ESCALATION_REVIEW_ACTIONS),
+        requested_at=now,
+        expires_at=now + settings.review.sla_seconds,
+    )
+
+
+def _read_envelope(raw: object, rebuilt: ReviewRequest) -> ReviewRecord:
+    """Turn whatever came back from ``interrupt()`` into a record.  Never raises.
+
+    The resume value is the least-typed input in the system and the one that can put
+    text in front of a customer, so it is treated exactly like a model response: parsed
+    against a schema, and on any doubt at all, refused.  A refusal is not an error - it
+    is a route, and it points where every other failure in this pipeline points.
+    """
+    envelope = raw if isinstance(raw, dict) else {}
+
+    # The facade echoes back the request that was actually persisted with the interrupt.
+    # Preferring it over ``rebuilt`` matters: this node re-executes from the top on
+    # resume, so ``rebuilt`` carries resume-time clocks, not pause-time ones.
+    try:
+        request = ReviewRequest.model_validate(envelope["request"])
+    except (KeyError, ValidationError):
+        request = rebuilt
+
+    if envelope.get(REVIEW_EXPIRED):
+        window = request.expires_at - request.requested_at
+        return ReviewRecord(
+            request=request,
+            refused=f"no verdict arrived within {window:.0f}s",
+        )
+
+    try:
+        verdict = ReviewVerdict.model_validate(envelope.get("verdict"))
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        detail = first.get("msg", "invalid").removeprefix("Value error, ")
+        return ReviewRecord(request=request, refused=f"unusable verdict: {detail}")
+
+    if verdict.action not in request.allowed_actions:
+        return ReviewRecord(
+            request=request,
+            verdict=verdict,
+            refused=f"action {verdict.action!r} is not offered at this pause",
+        )
+
+    return ReviewRecord(request=request, verdict=verdict)
+
+
+def human_review_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
+    """Pause a finished escalation on a named human, or pass straight through.
+
+    The node sits after the lint loop so the reviewer sees the brief that would actually
+    have been queued, not a draft of it.  When review is disabled it returns ``{}`` and
+    the ladder behaves exactly as it did before this node existed.
+
+    Everything before the ``interrupt()`` call runs a second time when the run resumes -
+    that is how LangGraph restores a suspended node - so this body stays cheap and does
+    no model work.
+    """
+    settings = runtime.context.settings
+    if not settings.review.enabled:
+        return {}
+
+    request = _review_request(state, settings)
+    record = _read_envelope(interrupt(request.model_dump(mode="json")), request)
+
+    if not record.accepted:
+        # Fail closed: the packet goes to the queue exactly as it would have anyway.
+        return {
+            "review": record,
+            "trace": [_row("human_review", ok=False, detail=record.refused)],
+        }
+
+    verdict = record.verdict
+    waited = verdict.decided_at - record.request.requested_at
+    trace = [
+        _row(
+            "human_review",
+            detail=f"{verdict.action} by {verdict.reviewer} after {waited:.0f}s",
+        )
+    ]
+
+    if verdict.action == "approve":
+        return {
+            "review": record,
+            "decision": Decision(
+                route="escalate",
+                reason=(
+                f"{verdict.reviewer} reviewed the brief and released it to the queue"
+            ),
+                rule="human_review",
+            ),
+            "trace": trace,
+        }
+
+    # The reviewer overrode the escalation.  Clearing the reason is what makes that real:
+    # every downstream router reads it as "stop climbing", and the clarify branch would
+    # otherwise bounce straight back to handoff.
+    return {"review": record, "escalation_reason": "", "trace": trace}
+
+
+def route_from_review(state: LadderState) -> str:
+    """Where a verdict sends the run.  Refusals and timeouts are not in the map."""
+    record = state.review
+    if record is None or not record.accepted:
+        return "finalise_escalation"
+    return _REVIEW_ROUTES.get(record.verdict.action, "finalise_escalation")
+
+
 def finalise_escalation_node(state: LadderState, runtime: Runtime[LadderDeps]) -> dict:
     decision = state.decision or Decision(
         route="escalate", reason=state.escalation_reason, rule="confidence_gate"
@@ -517,6 +723,32 @@ def finalise_escalation_node(state: LadderState, runtime: Runtime[LadderDeps]) -
 # --------------------------------------------------------------------------------------
 # Output
 # --------------------------------------------------------------------------------------
+
+
+def to_paused_resolution(
+    state: LadderState, started_at: float, request: ReviewRequest
+) -> Resolution:
+    """The resolution of a run that has stopped on a human.
+
+    Everything the automated tier produced is already here - the packet, the evidence,
+    the confidence breakdown - which is what the reviewer needs in order to decide.  Only
+    the route says this is not finished.
+    """
+    waiting = request.expires_at - request.requested_at
+    return to_resolution(state, started_at).model_copy(
+        update={
+            "route": "review",
+            "decision": Decision(
+                route="review",
+                reason=(
+                    f"the escalation brief is waiting on a reviewer for up to "
+                    f"{waiting / 60:.0f} min, after which it goes to the queue as it is"
+                ),
+                rule="human_review",
+            ),
+            "review": ReviewRecord(request=request),
+        }
+    )
 
 
 def to_resolution(state: LadderState, started_at: float) -> Resolution:
@@ -531,6 +763,7 @@ def to_resolution(state: LadderState, started_at: float) -> Resolution:
         draft=state.draft,
         confidence=state.confidence,
         retrieved=state.retrieved,
+        review=state.review,
         trace=state.trace,
         degraded=state.degraded or any(s.degraded for s in state.trace),
         started_at=started_at,

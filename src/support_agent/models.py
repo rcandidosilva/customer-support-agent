@@ -18,7 +18,7 @@ from __future__ import annotations
 import time
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # --------------------------------------------------------------------------------------
 # Shared vocabularies
@@ -52,7 +52,9 @@ Blocker = Literal[
     "low_confidence",           # nothing specific; the agent simply is not sure
 ]
 
-Route = Literal["send", "clarify", "escalate"]
+#: ``review`` is not a terminal route: it means the run is paused on a human and will
+#: resolve to one of the other three once a verdict arrives (or the deadline passes).
+Route = Literal["send", "clarify", "escalate", "review"]
 
 
 # --------------------------------------------------------------------------------------
@@ -295,6 +297,101 @@ class HandoffPacket(BaseModel):
 
 
 # --------------------------------------------------------------------------------------
+# Human review
+# --------------------------------------------------------------------------------------
+
+#: What a reviewer is allowed to say.  The *route* each action produces depends on where
+#: the run paused, not on the action itself - which is what lets the same vocabulary serve
+#: a reviewer looking at an escalation brief and (later) one looking at a draft reply.
+#:
+#: ``approve``       - release what the agent produced, unchanged.
+#: ``edit_and_send`` - send ``edited_reply`` to the customer instead.
+#: ``ask_customer``  - send ``edited_reply`` to the customer as a clarifying question.
+#: ``escalate``      - override to the human queue, saying why in ``rationale``.
+ReviewAction = Literal["approve", "edit_and_send", "ask_customer", "escalate"]
+
+
+class ReviewRequest(BaseModel):
+    """What a paused run hands the reviewer.
+
+    Deliberately thin: the artifact under review is already on the :class:`Resolution`
+    (the packet, the draft, the confidence breakdown), so duplicating it here would give
+    two copies that can disagree.  This carries only what is true of the *pause* itself.
+
+    The instance persisted with the interrupt is authoritative.  The node rebuilds an
+    equivalent request when it re-executes on resume - LangGraph re-runs a node's body up
+    to its ``interrupt()`` - so ``requested_at`` and ``expires_at`` computed in the node
+    are not trustworthy, and only the checkpointed copy is used to judge the deadline.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ticket_id: str
+    thread_id: str
+    #: Why the run stopped here, in the words already recorded on the escalation.
+    reason: str
+    #: Actions valid at *this* pause site.  A verdict outside this set is refused.
+    allowed_actions: list[ReviewAction]
+    requested_at: float = Field(default_factory=time.time)
+    #: Wall clock past which no verdict is accepted and the run finalises as an
+    #: escalation.  A pause nobody answers must not become a send.
+    expires_at: float = 0.0
+
+    def expired(self, now: float | None = None) -> bool:
+        return (now if now is not None else time.time()) > self.expires_at
+
+
+class ReviewVerdict(BaseModel):
+    """One human decision, validated the way every other boundary here is.
+
+    The resume value of a LangGraph ``interrupt()`` is whatever the caller passes, which
+    makes it the least-typed input in the system and the one with the most consequence -
+    it can put text in front of a customer.  So it gets the same treatment as a model
+    response: a schema, ``extra="forbid"``, and cross-field checks.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: ReviewAction
+    #: Who decided.  This is the audit record; an anonymous approval is not one.
+    reviewer: str
+    #: The reply the reviewer wrote.  Required by the two actions that reach a customer.
+    edited_reply: str = ""
+    #: Why they overrode the agent.  Required when escalating against its judgement.
+    rationale: str = ""
+    decided_at: float = Field(default_factory=time.time)
+
+    @model_validator(mode="after")
+    def _complete_for_action(self) -> ReviewVerdict:
+        if not self.reviewer.strip():
+            raise ValueError("a verdict needs a named reviewer")
+        needs_reply = self.action in ("edit_and_send", "ask_customer")
+        if needs_reply and not self.edited_reply.strip():
+            raise ValueError(f"action {self.action!r} needs a non-empty edited_reply")
+        if self.action == "escalate" and not self.rationale.strip():
+            raise ValueError("action 'escalate' needs a rationale")
+        return self
+
+
+class ReviewRecord(BaseModel):
+    """The audit trail of one review: what was asked, and what came back.
+
+    Present on the :class:`Resolution` whether the verdict was accepted, refused, or
+    never arrived - a refused verdict is exactly the event worth being able to find later.
+    """
+
+    request: ReviewRequest
+    #: ``None`` when the deadline passed or the verdict was refused.
+    verdict: ReviewVerdict | None = None
+    #: Empty when the verdict was accepted; otherwise why it was not.
+    refused: str = ""
+
+    @property
+    def accepted(self) -> bool:
+        return self.verdict is not None and not self.refused
+
+
+# --------------------------------------------------------------------------------------
 # Output
 # --------------------------------------------------------------------------------------
 
@@ -329,6 +426,9 @@ class Resolution(BaseModel):
     customer_reply: str = ""
     #: Present for ``escalate``.
     packet: HandoffPacket | None = None
+    #: Present once a run has paused on a human.  While ``route == "review"`` its
+    #: ``verdict`` is ``None``: the request is out and nothing has come back.
+    review: ReviewRecord | None = None
     classification: Classification | None = None
     draft: DraftAnswer | None = None
     confidence: ConfidenceReport | None = None
@@ -337,6 +437,16 @@ class Resolution(BaseModel):
     #: True when at least one stage failed and the ladder fell back rather than raising.
     degraded: bool = False
     started_at: float = Field(default_factory=time.time)
+
+    @property
+    def pending_review(self) -> bool:
+        """True when this resolution is a pause, not an outcome.
+
+        The reason ``run()`` can keep returning a ``Resolution``: a paused run is a
+        resolution whose route happens to be non-terminal, so callers that never enable
+        review are unaffected and callers that do have one flag to check.
+        """
+        return self.route == "review"
 
     @property
     def total_tokens(self) -> tuple[int, int]:

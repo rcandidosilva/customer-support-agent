@@ -57,6 +57,31 @@ class Thresholds:
 
 
 @dataclass(frozen=True)
+class ReviewConfig:
+    """Human-in-the-loop review of escalations.
+
+    Off by default, and deliberately a config question rather than a topology one: the
+    review node is always in the graph and is a pass-through when this is disabled, so
+    there is one shape of ladder to reason about rather than two.
+
+    Enabling it requires a checkpointer - a pause that cannot be persisted is a pause
+    that loses the ticket - and :class:`~support_agent.ladder.Ladder` refuses to build
+    without one.
+    """
+
+    enabled: bool = False
+    #: How long a brief may sit unreviewed.  On expiry the run finalises as an ordinary
+    #: escalation: the packet reaches the queue as it would have without review at all.
+    #: The deadline exists because the failure mode of a review step is silence, and
+    #: silence must not be able to hold a ticket forever.
+    sla_minutes: int = 30
+
+    @property
+    def sla_seconds(self) -> float:
+        return self.sla_minutes * 60.0
+
+
+@dataclass(frozen=True)
 class PolicyConfig:
     """Non-negotiable escalation triggers, evaluated before confidence is even read."""
 
@@ -93,6 +118,7 @@ class Settings:
     kb_dir: Path = KB_DIR
     thresholds: Thresholds = field(default_factory=Thresholds)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
     stages: dict[str, StageConfig] = field(
         default_factory=lambda: {
             "classify": StageConfig(effort="low", max_tokens=2048),
@@ -110,6 +136,12 @@ class Settings:
 
     def with_model(self, model: str) -> Settings:
         return replace(self, model=model)
+
+    def with_review(
+        self, *, enabled: bool = True, sla_minutes: int | None = None
+    ) -> Settings:
+        sla = self.review.sla_minutes if sla_minutes is None else sla_minutes
+        return replace(self, review=ReviewConfig(enabled=enabled, sla_minutes=sla))
 
     @classmethod
     def from_env(cls) -> Settings:

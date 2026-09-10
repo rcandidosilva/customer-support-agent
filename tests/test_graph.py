@@ -121,26 +121,47 @@ def test_the_auto_assembled_packet_is_not_rewritten(kb, settings: Settings):
 # -- topology ----------------------------------------------------------------------------
 
 
+def _edges() -> dict[str, set[str]]:
+    graph = build_ladder_graph().get_graph()
+    edges: dict[str, set[str]] = {}
+    for edge in graph.edges:
+        edges.setdefault(edge.source, set()).add(edge.target)
+    return edges
+
+
 def test_every_failure_edge_points_at_the_handoff(settings: Settings):
     """The structural guarantee: degradation can only ever route more conservatively.
 
     Asserted against the compiled graph rather than by reading the source, so adding a
     stage that quietly falls through to `send` fails here.
     """
-    graph = build_ladder_graph().get_graph()
-    edges: dict[str, set[str]] = {}
-    for edge in graph.edges:
-        edges.setdefault(edge.source, set()).add(edge.target)
+    edges = _edges()
 
     for stage in ("retrieve", "policy", "draft", "critique", "clarify"):
         targets = edges[stage]
         assert "handoff" in targets, f"{stage} has no escalation edge"
         assert "send" not in targets, f"{stage} can reach send directly"
 
-    # The gate is the only node allowed to route to send.
-    assert {s for s, t in edges.items() if "send" in t} == {"gate"}
+    # `send` is reachable from the gate, which is automation deciding it is confident,
+    # and from `human_review`, which is a named person overriding an escalation. Nothing
+    # else may reach it, and no *automated* stage may - `human_review` takes that edge
+    # only on a validated verdict (see test_review.py).
+    assert {s for s, t in edges.items() if "send" in t} == {"gate", "human_review"}
     # And the lint node is the only thing that can send work back for a rewrite.
     assert "handoff" in edges["handoff_lint"]
+
+
+def test_review_can_always_fall_back_to_the_queue(settings: Settings):
+    """The new node's fail-closed edge, asserted structurally rather than trusted.
+
+    A review step's characteristic failure is silence. If `human_review` could not reach
+    `finalise_escalation`, a ticket nobody looked at would have nowhere to go.
+    """
+    edges = _edges()
+    assert "finalise_escalation" in edges["human_review"]
+    # Review sits after the lint loop, so a reviewer reads the brief that would actually
+    # have been queued rather than a draft of it.
+    assert edges["handoff_lint"] == {"handoff", "human_review"}
 
 
 def test_the_graph_renders(kb, settings: Settings):

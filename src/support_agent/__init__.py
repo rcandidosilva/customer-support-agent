@@ -1,9 +1,10 @@
 """Customer-support deflection with a confidence-gated escalation ladder."""
 
-from .config import Settings, Thresholds
+from .checkpointing import serializer, sqlite_saver
+from .config import ReviewConfig, Settings, Thresholds
 from .graph import build_ladder_graph
 from .handoff_lint import lint_packet
-from .ladder import Ladder, run_ticket
+from .ladder import Ladder, NoReviewPending, run_ticket
 from .llm import AnthropicLLM, LLMError, ScriptedLLM
 from .models import (
     Classification,
@@ -13,6 +14,9 @@ from .models import (
     DraftAnswer,
     HandoffPacket,
     Resolution,
+    ReviewRecord,
+    ReviewRequest,
+    ReviewVerdict,
     Ticket,
 )
 from .nodes import LadderDeps, LadderState
@@ -32,7 +36,12 @@ __all__ = [
     "Ladder",
     "LadderDeps",
     "LadderState",
+    "NoReviewPending",
     "Resolution",
+    "ReviewConfig",
+    "ReviewRecord",
+    "ReviewRequest",
+    "ReviewVerdict",
     "ScriptedLLM",
     "Settings",
     "Thresholds",
@@ -42,6 +51,8 @@ __all__ = [
     "render_packet",
     "render_resolution",
     "run_ticket",
+    "serializer",
+    "sqlite_saver",
 ]
 
 __version__ = "0.1.0"

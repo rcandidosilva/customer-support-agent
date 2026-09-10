@@ -11,6 +11,10 @@ Two properties are worth reading off the diagram:
   more permissive outcome - only to ``handoff``.
 * **The lint loop is a real edge.** A brief that fails its quality check goes back to be
   rewritten once, rather than being shipped with a complaint recorded next to it.
+* **Exactly one node can route upward, and only a human can make it.** ``human_review``
+  is the sole edge from the escalation path back to ``send`` or ``clarify``, and it takes
+  it only on a validated verdict from a named reviewer.  Automation still cannot promote
+  itself.
 """
 
 from __future__ import annotations
@@ -29,8 +33,10 @@ from .nodes import (
     gate_node,
     handoff_lint_node,
     handoff_node,
+    human_review_node,
     policy_node,
     retrieve_node,
+    route_from_review,
     send_node,
 )
 
@@ -80,6 +86,7 @@ def build_ladder_graph(
         ("clarify", clarify_node),
         ("handoff", handoff_node),
         ("handoff_lint", handoff_lint_node),
+        ("human_review", human_review_node),
         ("finalise_escalation", finalise_escalation_node),
     ):
         graph.add_node(name, node)
@@ -116,8 +123,21 @@ def build_ladder_graph(
     graph.add_conditional_edges(
         "handoff_lint",
         lambda state: "handoff" if _needs_rewrite(state, max_handoff_attempts)
-        else "finalise_escalation",
-        {"handoff": "handoff", "finalise_escalation": "finalise_escalation"},
+        else "human_review",
+        {"handoff": "handoff", "human_review": "human_review"},
+    )
+    # The only node that can climb back *up* the ladder, and only ever because a named
+    # human said so.  With review disabled it is a pass-through to finalise_escalation,
+    # and so are a refused verdict and an expired deadline - the three ways this can go
+    # wrong all land on the behaviour the ladder had before the node existed.
+    graph.add_conditional_edges(
+        "human_review",
+        route_from_review,
+        {
+            "send": "send",
+            "clarify": "clarify",
+            "finalise_escalation": "finalise_escalation",
+        },
     )
     graph.add_edge("finalise_escalation", END)
 

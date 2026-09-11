@@ -143,10 +143,12 @@ def test_every_failure_edge_points_at_the_handoff(settings: Settings):
         assert "send" not in targets, f"{stage} can reach send directly"
 
     # `send` is reachable from the gate, which is automation deciding it is confident,
-    # and from `human_review`, which is a named person overriding an escalation. Nothing
-    # else may reach it, and no *automated* stage may - `human_review` takes that edge
+    # and from the two review nodes, each of which is a named person deciding. Nothing
+    # else may reach it, and no *automated* stage may - both review nodes take that edge
     # only on a validated verdict (see test_review.py).
-    assert {s for s, t in edges.items() if "send" in t} == {"gate", "human_review"}
+    assert {s for s, t in edges.items() if "send" in t} == {
+        "gate", "human_review", "draft_review",
+    }
     # And the lint node is the only thing that can send work back for a rewrite.
     assert "handoff" in edges["handoff_lint"]
 
@@ -162,6 +164,11 @@ def test_review_can_always_fall_back_to_the_queue(settings: Settings):
     # Review sits after the lint loop, so a reviewer reads the brief that would actually
     # have been queued rather than a draft of it.
     assert edges["handoff_lint"] == {"handoff", "human_review"}
+    # The band's fallback is an ordinary escalation: a draft nobody looked at goes where
+    # the gate would have sent it without the band.
+    assert "handoff" in edges["draft_review"]
+    # And the band is only reachable through the gate - nothing routes into it sideways.
+    assert {s for s, t in edges.items() if "draft_review" in t} == {"gate"}
 
 
 def test_the_graph_renders(kb, settings: Settings):

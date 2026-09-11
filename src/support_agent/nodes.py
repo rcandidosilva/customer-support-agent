@@ -138,6 +138,7 @@ def _row(
         input_tokens=usage.input_tokens if usage else 0,
         output_tokens=usage.output_tokens if usage else 0,
         degraded=degraded,
+        model=usage.model if usage else "",
     )
 
 

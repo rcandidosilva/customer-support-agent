@@ -135,14 +135,17 @@ def _render_review(resolution: Resolution) -> str:
 
 
 def render_trace(resolution: Resolution) -> str:
-    rows = ["| stage | ok | in | out | ms | detail |", "|---|---|---|---|---|---|"]
+    rows = [
+        "| stage | ok | model | in | out | ms | detail |",
+        "|---|---|---|---|---|---|---|",
+    ]
     for s in resolution.trace:
         mark = "ok" if s.ok else "FAIL"
         if s.degraded:
             mark += " (degraded)"
         detail = s.detail.replace("|", "\\|")
         rows.append(
-            f"| {s.stage} | {mark} | {s.input_tokens} | {s.output_tokens} "
+            f"| {s.stage} | {mark} | {s.model or '-'} | {s.input_tokens} "
             f"| {s.output_tokens} | {s.duration_ms:.0f} | {detail} |"
         )
     tin, tout = resolution.total_tokens

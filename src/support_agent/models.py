@@ -427,6 +427,10 @@ class StageTrace(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     degraded: bool = False
+    #: Which model answered, as ``provider:model``.  Empty for the rows no model
+    #: produced - the deterministic fallbacks, and the failures that never got a
+    #: response.  With per-stage routing this is what makes the token columns costable.
+    model: str = ""
 
 
 class Resolution(BaseModel):

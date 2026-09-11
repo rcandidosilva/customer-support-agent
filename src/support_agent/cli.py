@@ -1,6 +1,7 @@
 """Command line entry point.
 
     support-agent run examples/tickets/*.json      # the full ladder (needs an API key)
+    support-agent run t.json --provider openai     # the same ladder, other provider
     support-agent search "dashboard is stale"      # retrieval only, no API calls
     support-agent lint packet.json                 # check a saved handoff packet
     support-agent review --list                    # the human-review queue
@@ -23,10 +24,10 @@ from pydantic import ValidationError
 
 from . import review_log
 from .checkpointing import sqlite_saver
-from .config import Settings
+from .config import PROVIDER_MODELS, Settings
 from .handoff_lint import has_errors, lint_packet
 from .ladder import NoReviewPending
-from .llm import AnthropicLLM, MissingCredentials
+from .llm import MissingCredentials, RoutedLLM, build_llm
 from .models import HandoffPacket, ReviewVerdict, Ticket
 from .render import render_packet, render_resolution
 from .retrieval import KnowledgeBase
@@ -44,16 +45,39 @@ def _load_tickets(paths: list[str]) -> list[Ticket]:
     return tickets
 
 
-def cmd_run(args: argparse.Namespace) -> int:
+def _model_settings(args: argparse.Namespace) -> Settings:
+    """Environment first, then the flags, most specific last.
+
+    The same order :meth:`Settings.from_env` uses internally, so ``--provider openai
+    --stage-model handoff=anthropic:claude-opus-5`` composes the way it reads.
+    """
     settings = Settings.from_env()
+    if args.provider:
+        settings = settings.with_provider(args.provider)
     if args.model:
         settings = settings.with_model(args.model)
+    for pair in args.stage_model or ():
+        stage, _, ref = pair.partition("=")
+        if not ref:
+            raise SystemExit(f"--stage-model wants STAGE=MODEL, got {pair!r}")
+        settings = settings.with_stage_model(stage.strip(), ref)
+    return settings
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    try:
+        settings = _model_settings(args)
+    except ValueError as exc:
+        # A bad provider or model reference.  Caught here so it reads as a usage error
+        # rather than a traceback out of config.
+        print(exc, file=sys.stderr)
+        return 2
 
     kb = KnowledgeBase.from_dir(settings.kb_dir)
     tickets = _load_tickets(args.tickets)
 
     try:
-        llm = AnthropicLLM(settings.model)
+        llm = build_llm(settings)
     except (MissingCredentials, ImportError) as exc:
         print(
             f"{exc}\n"
@@ -61,6 +85,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+
+    if isinstance(llm, RoutedLLM):
+        # Worth saying out loud: a mixed route is the one configuration where reading
+        # the trace without knowing the plan is misleading.
+        route = "  ".join(f"{k}={v}" for k, v in llm.routing().items())
+        print(f"models: {route}", file=sys.stderr)
+    else:
+        print(f"model: {settings.model_ref()}", file=sys.stderr)
 
     from .ladder import Ladder
 
@@ -144,7 +176,7 @@ def _reviewing_ladder(args: argparse.Namespace, saver):
 
     settings = Settings.from_env().with_review()
     try:
-        llm = AnthropicLLM(settings.model)
+        llm = build_llm(settings)
     except (MissingCredentials, ImportError) as exc:
         llm = UnavailableLLM(str(exc))
 
@@ -296,7 +328,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("tickets", nargs="+", help="ticket JSON files")
     run.add_argument("--json", action="store_true", help="emit resolutions as JSON")
     run.add_argument("--no-trace", action="store_true", help="hide the per-stage trace")
-    run.add_argument("--model", help="override the model id")
+    run.add_argument("--provider", choices=sorted(PROVIDER_MODELS),
+                     help="which provider every stage runs on, with its default model")
+    run.add_argument("--model",
+                     help="the default model: `gpt-5`, or `openai:gpt-5` to switch "
+                          "provider at the same time")
+    run.add_argument("--stage-model", dest="stage_model", metavar="STAGE=MODEL",
+                     action="append",
+                     help="pin one stage to its own model; repeatable. e.g. "
+                          "--stage-model classify=openai:gpt-5-mini")
     run.set_defaults(func=cmd_run)
 
     search = sub.add_parser("search", help="query the knowledge base (no API calls)")

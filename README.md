@@ -88,8 +88,55 @@ The full ladder needs one. Set `ANTHROPIC_API_KEY`, then:
 ```
 
 Each ticket prints its route, the confidence breakdown, the reply or the rendered handoff
-brief, and a per-stage trace with token counts. `--json` emits the whole `Resolution`
-object instead; `support-agent lint packet.json` re-checks a saved packet.
+brief, and a per-stage trace with token counts and the model that spent them. `--json`
+emits the whole `Resolution` object instead; `support-agent lint packet.json` re-checks a
+saved packet.
+
+### Which model runs which stage
+
+Anthropic is the default. OpenAI needs its own extra and its own key
+(`pip install -e ".[openai]"`, `OPENAI_API_KEY`), and then either provider can run any
+stage:
+
+```bash
+.venv/bin/support-agent run examples/tickets/*.json --provider openai
+```
+
+A **model reference** is `provider:model`, or a bare `model` belonging to the configured
+provider. It is the same spelling everywhere a model can be named — flag, env var, or
+`StageConfig` — and per-stage references are what make a route mixed:
+
+```bash
+.venv/bin/support-agent run examples/tickets/*.json \
+    --provider openai \
+    --stage-model critique=anthropic:claude-opus-5 \
+    --stage-model handoff=anthropic:claude-opus-5
+```
+
+Cheap triage, drafting, and clarification on one provider; the two stages where being
+wrong is expensive — the critique that sets the confidence score, and the brief a person
+has to act on — on another. The same thing in the environment, so it is deployment
+config rather than a command line:
+
+```bash
+SUPPORT_AGENT_PROVIDER=openai
+SUPPORT_AGENT_MODEL_CRITIQUE=anthropic:claude-opus-5
+```
+
+The stage code does not change, and neither do the schemas. `build_llm(settings)` reads
+the table, builds one client per distinct model, and returns a plain adapter when every
+stage agrees or a `RoutedLLM` when they do not — so a single-model setup pays nothing for
+a feature it is not using. Every model on the route is built at startup, which keeps a
+missing key a startup failure rather than something the first escalation discovers.
+
+Each trace row names the model that answered it, because with a mixed route unattributed
+token counts cannot be costed:
+
+```
+| stage    | ok | model                  | in | out | ms | detail                |
+| classify | ok | openai:gpt-5-mini      | .. | ..  | .. | account/normal        |
+| critique | ok | anthropic:claude-opus-5| .. | ..  | .. | blocker=low_confidence|
+```
 
 ## The three design decisions worth stealing
 
@@ -475,7 +522,7 @@ to the escalation is the one a human would lead with.
 | [`handoff_lint.py`](src/support_agent/handoff_lint.py) | Mechanical quality checks on the brief. |
 | [`checkpointing.py`](src/support_agent/checkpointing.py) | The durable store a paused review lives in, and the serde allowlist that lets it be read back. |
 | [`review_log.py`](src/support_agent/review_log.py) | Append-only JSONL of what reviewers decided, beside what the agent predicted. |
-| [`llm.py`](src/support_agent/llm.py) | The only module that talks to Claude. `ScriptedLLM` is the same interface with no network. |
+| [`llm.py`](src/support_agent/llm.py) | The only module that talks to a provider. `AnthropicLLM` and `OpenAILLM` behind one interface, `RoutedLLM` picking between them per stage, and `ScriptedLLM` for the same interface with no network. |
 | [`kb/`](src/support_agent/kb) | Twelve help-centre articles for a fictional analytics SaaS. |
 | [`examples/offline_demo.py`](examples/offline_demo.py) | All three routes, scripted end to end, no credentials. |
 
@@ -527,9 +574,24 @@ Two of the first three mutations survived, which is how
 
 ## Notes on the API usage
 
-Every stage uses [structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)
-via `client.messages.parse(output_format=Model)`, so a stage either returns a validated
-Pydantic object or raises — there is no "the model returned prose this time" branch
-anywhere in the pipeline. Per-stage `effort` is set in `config.py` (triage is shallow;
-critique and the handoff are not), the long system prompts carry a cache breakpoint, and
-`stop_reason: "refusal"` is handled as just another unavailable rung.
+Every stage uses structured outputs, so a stage either returns a validated Pydantic
+object or raises — there is no "the model returned prose this time" branch anywhere in
+the pipeline. On Anthropic that is
+[`client.messages.parse(output_format=Model)`](https://platform.claude.com/docs/en/build-with-claude/structured-outputs);
+on OpenAI it is `client.responses.parse(text_format=Model)`. Per-stage `effort` is set in
+`config.py` (triage is shallow; critique and the handoff are not).
+
+The two adapters differ in three places, all absorbed inside `llm.py` rather than leaked
+into config:
+
+| | Anthropic | OpenAI |
+|---|---|---|
+| Effort | `output_config={"effort": ...}` on every model | `reasoning={"effort": ...}`, and only for the reasoning families — sending it to a chat model is a 400 |
+| Prompt caching | An explicit `cache_control` breakpoint on the long system prompt | Automatic on long prefixes; there is no breakpoint to place |
+| Refusal / truncation | `stop_reason: "refusal"` / `"max_tokens"` | A `refusal` content part / `status: "incomplete"` |
+
+All of it normalises onto one `LLMError`, so a refusal, a 500, a schema violation, and a
+truncation are the same event to the ladder — this rung is unavailable, take the next one
+down — whichever provider produced it. Adding a third provider is an adapter with two
+methods plus one entry in `PROVIDERS`; a name in `config.PROVIDER_MODELS` with no client
+behind it fails at import rather than on a ticket.

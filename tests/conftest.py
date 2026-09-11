@@ -27,6 +27,36 @@ from support_agent.models import (  # noqa: E402
 from support_agent.retrieval import KnowledgeBase  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """Nothing in this suite may build a real API client.
+
+    Not a nicety.  Credentials resolve from ``~/.config/anthropic`` as well as from the
+    environment, so unsetting ``ANTHROPIC_API_KEY`` does *not* make a test offline - it
+    makes it quietly billable.  Found the hard way: two CLI tests took 29 seconds each
+    because they were talking to the real API and nothing said so.
+
+    Anything reaching for a client fails here instead, loudly and instantly.  Injecting
+    one explicitly still works, which is what the client's own tests do.
+    """
+    from support_agent import llm
+
+    real_init = llm.AnthropicLLM.__init__
+
+    def guarded(self, *args, **kwargs):
+        # Signature-agnostic: `client` is the second positional or a keyword.
+        injected = kwargs.get("client") if "client" in kwargs else (
+            args[1] if len(args) > 1 else None
+        )
+        if injected is None:
+            raise llm.MissingCredentials(
+                "tests must not build a real API client; inject one or use ScriptedLLM"
+            )
+        return real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(llm.AnthropicLLM, "__init__", guarded)
+
+
 @pytest.fixture(scope="session")
 def settings() -> Settings:
     return Settings()

@@ -11,10 +11,10 @@ Two properties are worth reading off the diagram:
   more permissive outcome - only to ``handoff``.
 * **The lint loop is a real edge.** A brief that fails its quality check goes back to be
   rewritten once, rather than being shipped with a complaint recorded next to it.
-* **Exactly one node can route upward, and only a human can make it.** ``human_review``
-  is the sole edge from the escalation path back to ``send`` or ``clarify``, and it takes
-  it only on a validated verdict from a named reviewer.  Automation still cannot promote
-  itself.
+* **Only a human can route upward.** ``human_review`` is the sole edge from the
+  escalation path back to ``send`` or ``clarify``, and ``draft_review`` the sole edge from
+  a below-threshold score to ``send``.  Both take it only on a validated verdict from a
+  named reviewer.  Automation still cannot promote itself.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from .nodes import (
     classify_node,
     critique_node,
     draft_node,
+    draft_review_node,
     finalise_escalation_node,
     gate_node,
     handoff_lint_node,
@@ -36,6 +37,7 @@ from .nodes import (
     human_review_node,
     policy_node,
     retrieve_node,
+    route_from_draft_review,
     route_from_review,
     send_node,
 )
@@ -55,7 +57,9 @@ def _escalated_or(next_node: str):
 
 
 def _route_from_gate(state: LadderState) -> str:
-    return {"send": "send", "clarify": "clarify"}.get(state.route, _ESCALATED)
+    return {"send": "send", "clarify": "clarify", "review": "draft_review"}.get(
+        state.route, _ESCALATED
+    )
 
 
 def _needs_rewrite(state: LadderState, max_attempts: int):
@@ -82,6 +86,7 @@ def build_ladder_graph(
         ("draft", draft_node),
         ("critique", critique_node),
         ("gate", gate_node),
+        ("draft_review", draft_review_node),
         ("send", send_node),
         ("clarify", clarify_node),
         ("handoff", handoff_node),
@@ -109,6 +114,18 @@ def build_ladder_graph(
     graph.add_conditional_edges(
         "gate",
         _route_from_gate,
+        {
+            "send": "send",
+            "clarify": "clarify",
+            "draft_review": "draft_review",
+            _ESCALATED: _ESCALATED,
+        },
+    )
+    # The review band. Its fallback is `handoff`, so a draft nobody looked at becomes an
+    # ordinary escalation - the route the gate would have chosen without the band.
+    graph.add_conditional_edges(
+        "draft_review",
+        route_from_draft_review,
         {"send": "send", "clarify": "clarify", _ESCALATED: _ESCALATED},
     )
 

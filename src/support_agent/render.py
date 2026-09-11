@@ -8,6 +8,8 @@ then why it is on their desk, then what has already been said, then the work.
 
 from __future__ import annotations
 
+import time
+
 from .handoff_lint import lint_packet
 from .models import HandoffPacket, Resolution
 
@@ -86,6 +88,52 @@ def render_packet(packet: HandoffPacket, *, ticket_id: str = "") -> str:
     return "\n".join(sections).rstrip() + "\n"
 
 
+_SITE_LABELS = {
+    "draft": "an unsent reply",
+    "escalation": "a finished escalation brief",
+}
+
+
+def _render_review(resolution: Resolution) -> str:
+    """The review block: what was asked of a person, and what they said.
+
+    Shown for a pending pause and a finished one alike.  A refusal gets the same
+    prominence as a verdict, because "nobody looked at this in time" is the single most
+    useful thing the trail can tell an operator.
+    """
+    record = resolution.review
+    request = record.request
+    lines = [
+        "### Human review",
+        "",
+        f"- **Looking at:** {_SITE_LABELS.get(request.site, request.site)}",
+        f"- **Because:** {request.reason}",
+    ]
+
+    if resolution.pending_review:
+        waiting = max(request.expires_at - time.time(), 0.0)
+        lines += [
+            f"- **Waiting on:** `{request.thread_id}` — {waiting / 60:.0f} min left",
+            f"- **Can:** {', '.join(f'`{a}`' for a in request.allowed_actions)}",
+        ]
+        return "\n".join(lines)
+
+    if record.refused:
+        lines += [f"- **Not applied:** {record.refused}"]
+
+    if record.verdict is not None:
+        verdict = record.verdict
+        waited = verdict.decided_at - request.requested_at
+        lines += [
+            f"- **Decided:** `{verdict.action}` by **{verdict.reviewer}** "
+            f"after {waited / 60:.0f} min",
+        ]
+        if verdict.rationale:
+            lines += [f"- **Because:** {verdict.rationale}"]
+
+    return "\n".join(lines)
+
+
 def render_trace(resolution: Resolution) -> str:
     rows = ["| stage | ok | in | out | ms | detail |", "|---|---|---|---|---|---|"]
     for s in resolution.trace:
@@ -95,10 +143,10 @@ def render_trace(resolution: Resolution) -> str:
         detail = s.detail.replace("|", "\\|")
         rows.append(
             f"| {s.stage} | {mark} | {s.input_tokens} | {s.output_tokens} "
-            f"| {s.duration_ms:.0f} | {detail} |"
+            f"| {s.output_tokens} | {s.duration_ms:.0f} | {detail} |"
         )
     tin, tout = resolution.total_tokens
-    rows.append(f"| **total** |  | **{tin}** | **{tout}** |  |  |")
+    rows.append(f"| **total** |  |  | **{tin}** | **{tout}** |  |  |")
     return "\n".join(rows)
 
 
@@ -126,6 +174,9 @@ def render_resolution(resolution: Resolution, *, show_trace: bool = True) -> str
                 f"{c.article_id} ({c.score:.2f})" for c in resolution.retrieved
             ),
         ]
+
+    if resolution.review is not None:
+        parts += ["", _render_review(resolution)]
 
     if resolution.route in ("send", "clarify"):
         label = "Reply sent" if resolution.route == "send" else "Clarifying question sent"

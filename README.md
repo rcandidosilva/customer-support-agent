@@ -375,10 +375,78 @@ derived from the modules rather than typed out, which matters more than it looks
 block. A half-complete allowlist is worse than none. `LadderState` lives in `nodes.py`
 rather than `models.py` and was exactly the omission that proved the point.
 
-What is deliberately *not* here yet: a review band below `auto_send` (today only
-escalations pause, so a near-miss draft still costs a human a full write-up rather than an
-approval), a CLI to drive the queue, and the verdict log that would let `auto_send` be
-tuned against evidence instead of argument.
+## The review band
+
+`auto_send` is a cliff. A draft scoring 0.74 with clean citations used to become a full
+escalation — a person read a brief and wrote a reply from scratch, the most expensive
+possible outcome for a near miss. `review.floor` (0.62) opens a band beneath the send
+threshold where the draft is held for approval instead:
+
+```
+  ≥0.78          0.62–0.78            <0.62
+  SEND      →  DRAFT REVIEW  →  CLARIFY / ESCALATE
+               approve · edit · ask · reject
+```
+
+The same four verbs serve both pauses, but they mean different things at each, so routing
+is keyed by *site* rather than by action: `approve` releases the agent's draft at the band
+and queues the brief at an escalation. `escalate` is only offered at the band, because a
+run that is already escalating has nowhere to send it.
+
+**One review per ticket.** A reviewer who rejects a draft must not then be asked to review
+the brief their own decision produced — that is both absurd and a way to strand a ticket
+behind two deadlines.
+
+## The verdict log
+
+Every verdict is a label on the confidence gate. `review_log` appends one JSON object per
+decision, carrying the agent's score, components and penalties *beside* what the human
+did:
+
+```bash
+support-agent review --summary
+  reviews       48
+  answered      44
+  agreement     82%
+  median_score  0.71
+```
+
+That is the difference between tuning `auto_send` on evidence and tuning it on instinct.
+Refused rows — a timeout, a rejected verdict — stay distinguishable from disagreement:
+counting "nobody looked" as "the human disagreed" would bias every threshold decision
+downstream.
+
+## Driving the queue
+
+```bash
+support-agent review --list                      # what is waiting, and for how long
+support-agent review --show TKT-4471             # the draft or brief, and the options
+support-agent review --approve TKT-4471 --as you
+support-agent review --edit-and-send TKT-4471 --file reply.md --as you
+support-agent review --escalate TKT-4471 --why "needs invoice lines" --as you
+support-agent review --sweep                     # release everything overdue
+support-agent review --retry TKT-4471            # drive a STALLED run to completion
+```
+
+Three bugs came out of *running* this, not from reasoning about it, and each left a mark
+on the design:
+
+**Answering a review can need a model call.** Rejecting a draft writes a brief. The first
+version assumed otherwise and crashed. `UnavailableLLM` now raises `LLMError` — the event
+the ladder already survives — so a missing key degrades into the deterministic fallback
+packet rather than a traceback.
+
+**That crash stranded a ticket.** The pause was consumed and the verdict applied, then the
+run stopped partway: no interrupt, so `paused_threads()` could not see it and no sweep
+would ever reach it. `stalled_threads()` and `retry()` exist because of it, and `--list`
+shows stalled runs beside the queue.
+
+**Two tests were making real, billed API calls.** Credentials resolve from
+`~/.config/anthropic` as well as the environment, so unsetting `ANTHROPIC_API_KEY` does
+not make a test offline — it makes it quietly billable. The tell was a 52-second suite. An
+autouse `no_network` fixture now fails any test that reaches for a real client.
+
+What is still deliberately *not* here: per-reviewer routing, and any UI beyond the CLI.
 
 ## The policy gate
 
@@ -406,6 +474,7 @@ to the escalation is the one a human would lead with.
 | [`ladder.py`](src/support_agent/ladder.py) | The facade: `Ladder(llm, kb).run(ticket) -> Resolution`, plus `pending_review` / `resume` / `expire` for the human-review pause. |
 | [`handoff_lint.py`](src/support_agent/handoff_lint.py) | Mechanical quality checks on the brief. |
 | [`checkpointing.py`](src/support_agent/checkpointing.py) | The durable store a paused review lives in, and the serde allowlist that lets it be read back. |
+| [`review_log.py`](src/support_agent/review_log.py) | Append-only JSONL of what reviewers decided, beside what the agent predicted. |
 | [`llm.py`](src/support_agent/llm.py) | The only module that talks to Claude. `ScriptedLLM` is the same interface with no network. |
 | [`kb/`](src/support_agent/kb) | Twelve help-centre articles for a fictional analytics SaaS. |
 | [`examples/offline_demo.py`](examples/offline_demo.py) | All three routes, scripted end to end, no credentials. |
@@ -430,11 +499,13 @@ assert result.draft is not None      # the human still gets to see it
 assert result.confidence is None     # but nothing verified it
 ```
 
-155 tests cover retrieval, every policy rule, the fusion caps and floors, every lint rule,
-all four routes, all five degradation paths, the lint rewrite loop, the human-review pause
-(including every way a verdict can be refused), the expiry sweeper, and the topology
-itself. Two of them spawn a real subprocess to prove a pause survives the process that
-opened it — the one claim an in-memory checkpointer cannot make.
+187 tests cover retrieval, every policy rule, the fusion caps and floors, every lint rule,
+all four routes, all five degradation paths, the lint rewrite loop, both human-review
+pauses (including every way a verdict can be refused), the expiry sweeper, stalled-run
+recovery, the verdict log, the CLI, and the topology itself. Two spawn a real subprocess
+to prove a pause survives the process that opened it — the one claim an in-memory
+checkpointer cannot make — and an autouse fixture guarantees none of them can reach the
+network.
 
 The review tests were written against mutations rather than against the implementation:
 each invariant was checked by breaking it on purpose and confirming a test caught it.

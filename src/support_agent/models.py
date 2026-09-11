@@ -310,6 +310,16 @@ class HandoffPacket(BaseModel):
 #: ``escalate``      - override to the human queue, saying why in ``rationale``.
 ReviewAction = Literal["approve", "edit_and_send", "ask_customer", "escalate"]
 
+#: Where a run stopped.  The two sites ask genuinely different questions, and the same
+#: action means different things at each:
+#:
+#: ``draft``     - "is this reply safe to send?"  ``approve`` releases the agent's draft.
+#: ``escalation`` - "is this brief ready for the queue?"  ``approve`` queues it.
+#:
+#: Carried on the request rather than inferred, so the record of a finished review says
+#: what was actually being asked.
+ReviewSite = Literal["draft", "escalation"]
+
 
 class ReviewRequest(BaseModel):
     """What a paused run hands the reviewer.
@@ -328,6 +338,9 @@ class ReviewRequest(BaseModel):
 
     ticket_id: str
     thread_id: str
+    #: Which question is being asked.  Determines what the actions mean and where each
+    #: one sends the run.
+    site: ReviewSite = "escalation"
     #: Why the run stopped here, in the words already recorded on the escalation.
     reason: str
     #: Actions valid at *this* pause site.  A verdict outside this set is refused.

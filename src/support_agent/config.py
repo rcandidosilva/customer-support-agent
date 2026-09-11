@@ -2,6 +2,12 @@
 
 Every threshold in this file is a product decision disguised as a number.  They are
 gathered here so that changing the deflection rate is a config review, not a code change.
+
+Which *model* runs each stage is the same kind of decision, so it lives here too.  A
+stage names a model with a **model reference**: either a bare id (``claude-opus-5``,
+resolved against :attr:`Settings.provider`) or a qualified one (``openai:gpt-5``).  A
+stage that names nothing runs on :attr:`Settings.model`, so the single-model case stays a
+single setting and the mixed case needs no code.
 """
 
 from __future__ import annotations
@@ -10,21 +16,92 @@ import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-MODEL = "claude-opus-5"
+#: The default model for each provider.  These are the only provider names the project
+#: knows; :mod:`support_agent.llm` maps each to a client and asserts it covers them all.
+PROVIDER_MODELS = {
+    "anthropic": "claude-opus-5",
+    "openai": "gpt-5",
+}
+
+DEFAULT_PROVIDER = "anthropic"
+MODEL = PROVIDER_MODELS[DEFAULT_PROVIDER]
 
 KB_DIR = Path(__file__).parent / "kb"
+
+
+class UnknownProvider(ValueError):
+    """A provider name that no client implements.  A startup problem, caught early.
+
+    Raised while resolving config rather than on the first stage call, because a typo in
+    ``SUPPORT_AGENT_PROVIDER`` is not something to discover one ticket at a time.
+    """
+
+    def __init__(self, provider: str) -> None:
+        known = ", ".join(sorted(PROVIDER_MODELS))
+        super().__init__(f"unknown provider {provider!r}; known providers: {known}")
+        self.provider = provider
+
+
+@dataclass(frozen=True)
+class ModelRef:
+    """A provider and a model id: which engine actually runs one stage.
+
+    Parsed from ``provider:model`` or a bare ``model``, so every place a model can be
+    named - env var, CLI flag, per-stage override - accepts the same one-token spelling.
+    """
+
+    provider: str
+    model: str
+
+    def __post_init__(self) -> None:
+        if self.provider not in PROVIDER_MODELS:
+            raise UnknownProvider(self.provider)
+
+    @classmethod
+    def parse(cls, ref: str, *, default_provider: str = DEFAULT_PROVIDER) -> ModelRef:
+        """``"openai:gpt-5"`` or ``"claude-opus-5"`` -> a :class:`ModelRef`.
+
+        A bare provider name (``"openai"``) resolves to that provider's default model,
+        which is what makes ``--provider openai`` enough on its own.
+        """
+        ref = ref.strip()
+        if not ref:
+            raise ValueError("a model reference cannot be empty")
+        if ":" in ref:
+            provider, _, model = ref.partition(":")
+            provider, model = provider.strip(), model.strip()
+            if not model:
+                raise ValueError(f"model reference {ref!r} names no model")
+            return cls(provider, model)
+        # Anthropic and OpenAI model ids do not collide with provider names, so a bare
+        # provider name is unambiguous shorthand for "that provider's default".
+        if ref in PROVIDER_MODELS:
+            return cls(ref, PROVIDER_MODELS[ref])
+        return cls(default_provider, ref)
+
+    def __str__(self) -> str:
+        return f"{self.provider}:{self.model}"
 
 
 @dataclass(frozen=True)
 class StageConfig:
     """Per-stage model settings.
 
-    Effort is the lever, not the model.  Triage and clarification are shallow tasks;
-    critique and the handoff packet are where thinking actually buys something.
+    Effort is the first lever, and usually the only one needed: triage and clarification
+    are shallow tasks, while critique and the handoff packet are where thinking actually
+    buys something.  ``model`` is the second - a stage that wants a different engine
+    entirely (a cheap one for triage, a stronger one for the brief) names it here, as a
+    model reference, and gets it without any change to the stage code.
     """
 
     effort: str = "medium"
     max_tokens: int = 4096
+    #: A model reference, or ``""`` to run this stage on :attr:`Settings.model`.
+    #:
+    #: Note for reasoning models behind the OpenAI provider: reasoning tokens are billed
+    #: against ``max_tokens`` there, where Anthropic's adaptive thinking is not, so a
+    #: stage pinned to one may need more headroom than the number tuned for Claude.
+    model: str = ""
 
 
 @dataclass(frozen=True)
@@ -124,6 +201,12 @@ class PolicyConfig:
 
 @dataclass(frozen=True)
 class Settings:
+    #: Which provider a bare model id belongs to, and the default when only a provider
+    #: is named.
+    provider: str = DEFAULT_PROVIDER
+    #: The model every stage runs on unless its :class:`StageConfig` names another.  A
+    #: bare id belongs to :attr:`provider`; a qualified one (``openai:gpt-5``) overrides
+    #: it, which is why setting this alone is enough to switch providers.
     model: str = MODEL
     kb_dir: Path = KB_DIR
     thresholds: Thresholds = field(default_factory=Thresholds)
@@ -144,8 +227,53 @@ class Settings:
     def stage(self, name: str) -> StageConfig:
         return self.stages.get(name, StageConfig())
 
+    def model_ref(self, stage: str | None = None) -> ModelRef:
+        """Which engine runs ``stage`` - the per-stage override, else the default.
+
+        The single place the resolution order is written down, so the router, the CLI's
+        summary line, and the trace all agree on what is about to run.
+        """
+        ref = self.stage(stage).model if stage else ""
+        return ModelRef.parse(ref or self.model, default_provider=self.provider)
+
+    def model_refs(self) -> dict[str, ModelRef]:
+        """Every distinct stage-to-model binding, for the router to build clients from.
+
+        Keyed by stage, and it includes only stages this config actually declares - a
+        stage nobody has an opinion about resolves to the default at call time.
+        """
+        return {name: self.model_ref(name) for name in self.stages}
+
+    def with_provider(self, provider: str) -> Settings:
+        """Switch providers, taking that provider's default model with it.
+
+        The model moves too because an id and a provider are not independent: pointing
+        the OpenAI client at ``claude-opus-5`` is a 404, not a configuration.  Pass a
+        qualified ref to :meth:`with_model` afterwards to pick a specific model.
+        """
+        if provider not in PROVIDER_MODELS:
+            raise UnknownProvider(provider)
+        return replace(self, provider=provider, model=PROVIDER_MODELS[provider])
+
     def with_model(self, model: str) -> Settings:
-        return replace(self, model=model)
+        """Set the default model, from a bare or qualified reference.
+
+        A qualified ref moves the provider as well, so ``--model openai:gpt-5`` does the
+        whole job in one flag.
+        """
+        ref = ModelRef.parse(model, default_provider=self.provider)
+        return replace(self, provider=ref.provider, model=ref.model)
+
+    def with_stage_model(self, stage: str, model: str) -> Settings:
+        """Pin one stage to its own model, leaving every other stage alone.
+
+        Validated here rather than at first call: a mistyped ref should fail before a
+        ticket is half-processed.
+        """
+        ModelRef.parse(model, default_provider=self.provider)
+        stages = dict(self.stages)
+        stages[stage] = replace(stages.get(stage, StageConfig()), model=model)
+        return replace(self, stages=stages)
 
     def with_review(
         self,
@@ -166,9 +294,24 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> Settings:
+        """Read the environment.
+
+        Model settings, in increasing specificity - each one overriding the last:
+
+        * ``SUPPORT_AGENT_PROVIDER=openai`` - switch providers wholesale.
+        * ``SUPPORT_AGENT_MODEL=openai:gpt-5-mini`` - the default model for every stage.
+        * ``SUPPORT_AGENT_MODEL_CRITIQUE=anthropic:claude-opus-5`` - one stage only,
+          one variable per stage name.  This is the multi-model case: cheap triage on
+          one provider, the judgement calls on another.
+        """
         settings = cls()
+        if provider := os.getenv("SUPPORT_AGENT_PROVIDER"):
+            settings = settings.with_provider(provider.strip().lower())
         if model := os.getenv("SUPPORT_AGENT_MODEL"):
             settings = settings.with_model(model)
+        for stage in tuple(settings.stages):
+            if ref := os.getenv(f"SUPPORT_AGENT_MODEL_{stage.upper()}"):
+                settings = settings.with_stage_model(stage, ref)
         if os.getenv("SUPPORT_AGENT_REVIEW", "").strip().lower() in ("1", "true", "yes"):
             settings = settings.with_review(
                 floor=_env_float("SUPPORT_AGENT_REVIEW_FLOOR", settings.review.floor),

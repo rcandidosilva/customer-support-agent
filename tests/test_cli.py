@@ -4,9 +4,17 @@ import json
 from pathlib import Path
 
 import pytest
-from conftest import make_packet
+from conftest import (
+    make_clarify,
+    make_classification,
+    make_critique,
+    make_draft,
+    make_packet,
+    make_ticket,
+)
 
-from support_agent.cli import main
+from support_agent.cli import _model_settings, build_parser, main
+from support_agent.config import PROVIDER_MODELS
 
 
 def test_search_finds_articles(capsys):
@@ -47,6 +55,96 @@ def test_lint_unwraps_a_resolution(tmp_path: Path, capsys):
 def test_run_reports_a_missing_ticket_file():
     with pytest.raises(SystemExit):
         main(["run", "no-such-file.json"])
+
+
+# -- choosing models --------------------------------------------------------------------
+
+
+def parse_run(*argv: str):
+    """The flags as `cmd_run` sees them, without running anything."""
+    return _model_settings(build_parser().parse_args(["run", "t.json", *argv]))
+
+
+def test_the_provider_flag_takes_that_providers_default_model():
+    assert parse_run("--provider", "openai").model_ref().provider == "openai"
+
+
+def test_the_model_flag_can_switch_provider_on_its_own():
+    settings = parse_run("--model", "openai:gpt-5-mini")
+    assert str(settings.model_ref()) == "openai:gpt-5-mini"
+
+
+def test_stage_model_flags_compose_with_the_provider_flag():
+    """The documented mixed route: one provider by default, one stage sent elsewhere."""
+    settings = parse_run(
+        "--provider", "openai", "--stage-model", "handoff=anthropic:claude-opus-5"
+    )
+    assert str(settings.model_ref("classify")) == f"openai:{PROVIDER_MODELS['openai']}"
+    assert str(settings.model_ref("handoff")) == "anthropic:claude-opus-5"
+
+
+def test_a_stage_model_flag_without_a_model_is_a_usage_error():
+    with pytest.raises(SystemExit):
+        parse_run("--stage-model", "handoff")
+
+
+def test_run_rejects_an_unknown_provider_before_doing_any_work(capsys):
+    """Reads as a usage error, and never gets as far as opening a ticket file."""
+    assert main(["run", "no-such-file.json", "--model", "openai2:gpt-5"]) == 2
+    assert "unknown provider" in capsys.readouterr().err
+
+
+@pytest.fixture
+def scripted_run(tmp_path: Path, monkeypatch):
+    """`support-agent run` over one ticket, with every stage scripted per model.
+
+    The real `build_llm` still does the routing - only the leaf clients are fake - so
+    what the CLI reports is what the configuration actually built.
+    """
+    from support_agent import cli
+    from support_agent.llm import ScriptedLLM, build_llm
+
+    responses = {
+        "classify": [make_classification()] * 3,
+        "draft": [make_draft()] * 3,
+        "critique": [make_critique()] * 3,
+        "clarify": [make_clarify()] * 3,
+        "handoff": [make_packet()] * 3,
+    }
+    monkeypatch.setattr(
+        cli,
+        "build_llm",
+        lambda settings: build_llm(
+            settings,
+            factory=lambda ref: ScriptedLLM(responses=dict(responses), ref=str(ref)),
+        ),
+    )
+
+    path = tmp_path / "ticket.json"
+    path.write_text(json.dumps(make_ticket().model_dump(mode="json")))
+    return str(path)
+
+
+def test_run_says_which_model_it_used(scripted_run, capsys):
+    assert main(["run", scripted_run, "--no-trace"]) == 0
+    assert "model: anthropic:claude-opus-5" in capsys.readouterr().err
+
+
+def test_run_spells_out_a_mixed_route(scripted_run, capsys):
+    """Reading a mixed-route trace without knowing the plan is misleading."""
+    assert main(["run", scripted_run, "--no-trace",
+                 "--stage-model", "classify=openai:gpt-5-mini"]) == 0
+    err = capsys.readouterr().err
+    assert "models:" in err
+    assert "default=anthropic:claude-opus-5" in err
+    assert "classify=openai:gpt-5-mini" in err
+
+
+def test_the_trace_attributes_each_stage_to_the_model_that_ran_it(scripted_run, capsys):
+    main(["run", scripted_run, "--stage-model", "classify=openai:gpt-5-mini"])
+    out = capsys.readouterr().out
+    assert "| classify | ok | openai:gpt-5-mini |" in out
+    assert "| draft | ok | anthropic:claude-opus-5 |" in out
 
 # -- the review queue -------------------------------------------------------------------
 #

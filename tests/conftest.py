@@ -38,23 +38,31 @@ def no_network(monkeypatch):
 
     Anything reaching for a client fails here instead, loudly and instantly.  Injecting
     one explicitly still works, which is what the client's own tests do.
+
+    Applied to every provider in the registry rather than to Anthropic by name, so
+    adding a provider cannot quietly reopen the hole.
     """
     from support_agent import llm
 
-    real_init = llm.AnthropicLLM.__init__
+    def guard(adapter):
+        real_init = adapter.__init__
 
-    def guarded(self, *args, **kwargs):
-        # Signature-agnostic: `client` is the second positional or a keyword.
-        injected = kwargs.get("client") if "client" in kwargs else (
-            args[1] if len(args) > 1 else None
-        )
-        if injected is None:
-            raise llm.MissingCredentials(
-                "tests must not build a real API client; inject one or use ScriptedLLM"
+        def guarded(self, *args, **kwargs):
+            # Signature-agnostic: `client` is the second positional or a keyword.
+            injected = kwargs.get("client") if "client" in kwargs else (
+                args[1] if len(args) > 1 else None
             )
-        return real_init(self, *args, **kwargs)
+            if injected is None:
+                raise llm.MissingCredentials(
+                    "tests must not build a real API client; inject one or use "
+                    "ScriptedLLM"
+                )
+            return real_init(self, *args, **kwargs)
 
-    monkeypatch.setattr(llm.AnthropicLLM, "__init__", guarded)
+        monkeypatch.setattr(adapter, "__init__", guarded)
+
+    for adapter in set(llm.PROVIDERS.values()):
+        guard(adapter)
 
 
 @pytest.fixture(scope="session")

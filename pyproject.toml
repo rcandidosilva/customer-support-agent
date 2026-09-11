@@ -16,6 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "langgraph-checkpoint-sqlite>=2.0"]
+# The OpenAI provider. Optional because the ladder does not need it to run, and the test
+# suite exercises the adapter against an injected fake rather than the SDK.
+openai = ["openai>=1.75"]
 # A durable store for runs paused on human review. Not needed to run the ladder, and not
 # needed by the test suite's in-memory checkpoints - only to keep a review queue across a
 # restart, which is the point of having one.

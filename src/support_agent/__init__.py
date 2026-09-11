@@ -2,11 +2,19 @@
 
 from . import review_log
 from .checkpointing import serializer, sqlite_saver
-from .config import ReviewConfig, Settings, Thresholds
+from .config import ModelRef, ReviewConfig, Settings, Thresholds
 from .graph import build_ladder_graph
 from .handoff_lint import lint_packet
 from .ladder import Ladder, NoReviewPending, run_ticket
-from .llm import AnthropicLLM, LLMError, ScriptedLLM, UnavailableLLM
+from .llm import (
+    AnthropicLLM,
+    LLMError,
+    OpenAILLM,
+    RoutedLLM,
+    ScriptedLLM,
+    UnavailableLLM,
+    build_llm,
+)
 from .models import (
     Classification,
     ConfidenceReport,
@@ -37,18 +45,22 @@ __all__ = [
     "Ladder",
     "LadderDeps",
     "LadderState",
+    "ModelRef",
     "NoReviewPending",
+    "OpenAILLM",
     "Resolution",
     "ReviewConfig",
     "ReviewRecord",
     "ReviewRequest",
     "ReviewVerdict",
+    "RoutedLLM",
     "ScriptedLLM",
     "Settings",
     "Thresholds",
     "Ticket",
     "UnavailableLLM",
     "build_ladder_graph",
+    "build_llm",
     "lint_packet",
     "render_packet",
     "render_resolution",
